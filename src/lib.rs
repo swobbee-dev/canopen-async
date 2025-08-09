@@ -1,13 +1,17 @@
 #![no_std]
 
 use core::cell::RefCell;
-use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex, signal::Signal};
+use core::marker::PhantomData;
 use embassy_time::Duration;
 use embedded_can::{Frame, Id, StandardId, asynch::CanTx};
 
+pub mod sync;
+
+pub use sync::{AsyncMutex, AsyncSignal};
+
 #[allow(dead_code)]
-#[derive(Debug, PartialEq)]
-pub enum SdoError<E> {
+#[derive(Debug, PartialEq, Clone)]
+pub enum SdoError<E: Clone> {
     Timeout,
     RequestPending,
     TxError(E),
@@ -32,19 +36,29 @@ impl<E> defmt::Format for SdoError<E> {
     }
 }
 
-pub struct SdoClient<FRAME, TX: CanTx<Frame = FRAME>> {
+pub struct SdoClient<FRAME, TX, M, S> 
+where
+    TX: CanTx<Frame = FRAME>,
+    TX::Error: Clone,
+    M: AsyncMutex,
+    S: AsyncSignal,
+{
     node_id: u8,
-    request_lock: Mutex<NoopRawMutex, ()>,
-    state: RequestState<FRAME, TX>,
-    can_tx: Mutex<NoopRawMutex, TX>,
+    request_lock: M::Mutex<()>,
+    state: RequestState<S, TX::Error>,
+    can_tx: M::Mutex<TX>,
     timeout: Duration,
+    _phantom: PhantomData<(FRAME, TX)>,
 }
 
-struct RequestState<FRAME, TX: CanTx<Frame = FRAME>> {
+struct RequestState<S, TxError: Clone> 
+where
+    S: AsyncSignal,
+{
     pending: RefCell<Option<Pending>>,
-    sig_word: Signal<NoopRawMutex, Result<u32, SdoError<TX::Error>>>,
-    sig_seg: Signal<NoopRawMutex, Result<Segment, SdoError<TX::Error>>>,
-    sig_ack: Signal<NoopRawMutex, Result<(), SdoError<TX::Error>>>,
+    word_signal: S::Signal<Result<u32, SdoError<TxError>>>,
+    segment_signal: S::Signal<Result<Segment, SdoError<TxError>>>,
+    ack_signal: S::Signal<Result<(), SdoError<TxError>>>,
 }
 
 enum SdoRequest<'a> {
@@ -104,35 +118,46 @@ impl<'a> Drop for PendingGuard<'a> {
     }
 }
 
-impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
-    pub fn new(node_id: u8, tx: TX, timeout: Duration) -> Result<Self, SdoError<TX::Error>> {
+impl<FRAME: Frame, TX, M, S> SdoClient<FRAME, TX, M, S>
+where
+    TX: CanTx<Frame = FRAME>,
+    TX::Error: Clone,
+    M: AsyncMutex,
+    S: AsyncSignal,
+{
+    pub fn new(
+        node_id: u8, 
+        timeout: Duration,
+        can_tx_mutex: M::Mutex<TX>,
+    ) -> Result<Self, SdoError<TX::Error>> {
         if node_id > 127 {
             return Err(SdoError::InvalidNodeId);
         }
 
         Ok(Self {
             node_id,
-            request_lock: Mutex::new(()),
+            request_lock: M::new(()),
             state: RequestState {
                 pending: RefCell::new(None),
-                sig_word: Signal::new(),
-                sig_seg: Signal::new(),
-                sig_ack: Signal::new(),
+                word_signal: S::new(),
+                segment_signal: S::new(),
+                ack_signal: S::new(),
             },
-            can_tx: Mutex::new(tx),
+            can_tx: can_tx_mutex,
             timeout,
+            _phantom: PhantomData,
         })
     }
 
-    async fn request_response<'a, R>(
+    async fn request_response<'a, R: Clone>(
         &self,
         request_to_send: SdoRequest<'a>,
         pending_state: Pending,
-        response_signal: &Signal<NoopRawMutex, Result<R, SdoError<TX::Error>>>,
+        response_signal: &S::Signal<Result<R, SdoError<TX::Error>>>,
     ) -> Result<R, SdoError<TX::Error>> {
         *self.state.pending.borrow_mut() = Some(pending_state);
         let _guard = PendingGuard::new(&self.state.pending);
-        response_signal.reset();
+        S::reset(response_signal);
 
         // Transmit the request frame
         match request_to_send {
@@ -156,14 +181,14 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         .map_err(SdoError::TxError)?;
 
         // Wait for the response
-        match embassy_time::with_timeout(self.timeout, response_signal.wait()).await {
+        match embassy_time::with_timeout(self.timeout, S::wait(response_signal)).await {
             Ok(inner_result) => inner_result,
             Err(_) => Err(SdoError::Timeout),
         }
     }
 
     pub async fn read_expedited(&self, index: u16, sub: u8) -> Result<u32, SdoError<TX::Error>> {
-        let _guard = self.request_lock.lock().await;
+        let _guard = M::lock(&self.request_lock).await;
         self.read_expedited_locked(index, sub).await
     }
 
@@ -173,7 +198,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         sub: u8,
         data: &[u8],
     ) -> Result<(), SdoError<TX::Error>> {
-        let _guard = self.request_lock.lock().await;
+        let _guard = M::lock(&self.request_lock).await;
         self.write_expedited_locked(index, sub, data).await
     }
 
@@ -183,7 +208,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         sub: u8,
         buf: &mut [u8],
     ) -> Result<(), SdoError<TX::Error>> {
-        let _guard = self.request_lock.lock().await;
+        let _guard = M::lock(&self.request_lock).await;
         self.read_segmented_locked(index, sub, buf).await
     }
 
@@ -194,7 +219,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         sub: u8,
         data: &[u8],
     ) -> Result<(), SdoError<TX::Error>> {
-        let _guard = self.request_lock.lock().await;
+        let _guard = M::lock(&self.request_lock).await;
         self.write_segmented_locked(index, sub, data).await
     }
 
@@ -205,7 +230,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         sub: u8,
         buf: &mut [u8],
     ) -> Result<(), SdoError<TX::Error>> {
-        let _guard = self.request_lock.lock().await;
+        let _guard = M::lock(&self.request_lock).await;
         self.read_block_locked(index, sub, buf).await
     }
 
@@ -216,7 +241,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         sub: u8,
         data: &[u8],
     ) -> Result<(), SdoError<TX::Error>> {
-        let _guard = self.request_lock.lock().await;
+        let _guard = M::lock(&self.request_lock).await;
         self.write_block_locked(index, sub, data).await
     }
 
@@ -252,7 +277,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                 let response_index = u16::from_le_bytes(frame.data()[1..3].try_into().unwrap());
                 let response_sub = frame.data()[3];
                 if response_index != index || response_sub != sub {
-                    self.state.sig_word.signal(Err(SdoError::InvalidResponse));
+                    S::signal(&self.state.word_signal, Err(SdoError::InvalidResponse));
                     return;
                 }
 
@@ -263,16 +288,16 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                         let data_len = 4 - n_unused;
                         let mut bytes = [0u8; 4];
                         bytes[..data_len].copy_from_slice(&frame.data()[4..4 + data_len]);
-                        self.state.sig_word.signal(Ok(u32::from_le_bytes(bytes)));
+                        S::signal(&self.state.word_signal, Ok(u32::from_le_bytes(bytes)));
                     }
                     // Segmented Upload Initiation Response
                     0x41 => {
                         let size = u32::from_le_bytes(frame.data()[4..8].try_into().unwrap());
-                        self.state.sig_word.signal(Ok(size));
+                        S::signal(&self.state.word_signal, Ok(size));
                     }
                     // Any other command is invalid for this state.
                     _ => {
-                        self.state.sig_word.signal(Err(SdoError::InvalidResponse));
+                        S::signal(&self.state.word_signal, Err(SdoError::InvalidResponse));
                     }
                 }
             }
@@ -282,15 +307,15 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                 let response_index = u16::from_le_bytes(frame.data()[1..3].try_into().unwrap());
                 let response_sub = frame.data()[3];
                 if response_index != index || response_sub != sub {
-                    self.state.sig_ack.signal(Err(SdoError::InvalidResponse));
+                    S::signal(&self.state.ack_signal, Err(SdoError::InvalidResponse));
                     return;
                 }
 
                 // The only valid response is a download confirmation.
                 if command == 0x60 {
-                    self.state.sig_ack.signal(Ok(()));
+                    S::signal(&self.state.ack_signal, Ok(()));
                 } else {
-                    self.state.sig_ack.signal(Err(SdoError::InvalidResponse));
+                    S::signal(&self.state.ack_signal, Err(SdoError::InvalidResponse));
                 }
             }
 
@@ -299,7 +324,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                 if (command & 0xE0) == 0x00 {
                     let response_toggle = (command & 0x10) != 0;
                     if response_toggle != toggle {
-                        self.state.sig_seg.signal(Err(SdoError::InvalidResponse));
+                        S::signal(&self.state.segment_signal, Err(SdoError::InvalidResponse));
                         return;
                     }
 
@@ -309,9 +334,9 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                     let mut data = [0u8; 7];
                     data[..len].copy_from_slice(&frame.data()[1..1 + len]);
                     let segment = Segment { last, len, data };
-                    self.state.sig_seg.signal(Ok(segment));
+                    S::signal(&self.state.segment_signal, Ok(segment));
                 } else {
-                    self.state.sig_seg.signal(Err(SdoError::InvalidResponse));
+                    S::signal(&self.state.segment_signal, Err(SdoError::InvalidResponse));
                 }
             }
 
@@ -320,12 +345,12 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                 if (command & 0b1110_1111) == 0b0010_0000 {
                     let response_toggle = (command & 0b0001_0000) != 0;
                     if response_toggle == toggle {
-                        self.state.sig_ack.signal(Ok(()));
+                        S::signal(&self.state.ack_signal, Ok(()));
                     } else {
-                        self.state.sig_ack.signal(Err(SdoError::InvalidResponse));
+                        S::signal(&self.state.ack_signal, Err(SdoError::InvalidResponse));
                     }
                 } else {
-                    self.state.sig_ack.signal(Err(SdoError::InvalidResponse));
+                    S::signal(&self.state.ack_signal, Err(SdoError::InvalidResponse));
                 }
             }
         };
@@ -335,7 +360,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         self.request_response(
             SdoRequest::UploadExpedited { index, sub },
             Pending::ExpeditedRead { index, sub },
-            &self.state.sig_word,
+            &self.state.word_signal,
         )
         .await
     }
@@ -353,7 +378,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         self.request_response(
             SdoRequest::DownloadExpedited { index, sub, data },
             Pending::ExpeditedWrite { index, sub },
-            &self.state.sig_ack,
+            &self.state.ack_signal,
         )
         .await
     }
@@ -380,7 +405,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                 .request_response(
                     SdoRequest::UploadSegment { toggle },
                     Pending::UploadSegment { toggle },
-                    &self.state.sig_seg,
+                    &self.state.segment_signal,
                 )
                 .await?;
 
@@ -411,7 +436,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                 size: data.len() as u32,
             },
             Pending::SegmentedDownloadInit { index, sub },
-            &self.state.sig_ack,
+            &self.state.ack_signal,
         )
         .await?;
 
@@ -427,7 +452,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                     data: chunk,
                 },
                 Pending::DownloadSegment { toggle },
-                &self.state.sig_ack,
+                &self.state.ack_signal,
             )
             .await?;
 
@@ -456,12 +481,12 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
 
     fn signal_error(&self, pending: Pending, err: SdoError<TX::Error>) {
         match pending {
-            Pending::ExpeditedRead { .. } => self.state.sig_word.signal(Err(err)),
+            Pending::ExpeditedRead { .. } => S::signal(&self.state.word_signal, Err(err)),
             Pending::ExpeditedWrite { .. } | Pending::SegmentedDownloadInit { .. } => {
-                self.state.sig_ack.signal(Err(err))
+                S::signal(&self.state.ack_signal, Err(err))
             }
-            Pending::UploadSegment { .. } => self.state.sig_seg.signal(Err(err)),
-            Pending::DownloadSegment { .. } => self.state.sig_ack.signal(Err(err)),
+            Pending::UploadSegment { .. } => S::signal(&self.state.segment_signal, Err(err)),
+            Pending::DownloadSegment { .. } => S::signal(&self.state.ack_signal, Err(err)),
         }
     }
 
@@ -474,7 +499,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         payload[1..3].copy_from_slice(&index.to_le_bytes());
         payload[3] = subindex;
         let frame = FRAME::new(Id::Standard(StandardId::new(id).unwrap()), &payload).unwrap();
-        self.can_tx.lock().await.transmit(&frame).await
+        M::lock(&self.can_tx).await.transmit(&frame).await
     }
 
     async fn send_sdo_download_request(
@@ -496,7 +521,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         payload[4..4 + len].copy_from_slice(data);
 
         let frame = FRAME::new(Id::Standard(StandardId::new(id).unwrap()), &payload).unwrap();
-        self.can_tx.lock().await.transmit(&frame).await
+        M::lock(&self.can_tx).await.transmit(&frame).await
     }
 
     async fn send_initiate_segmented_download(
@@ -513,7 +538,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         payload[4..8].copy_from_slice(&size.to_le_bytes());
 
         let frame = FRAME::new(Id::Standard(StandardId::new(id).unwrap()), &payload).unwrap();
-        self.can_tx.lock().await.transmit(&frame).await
+        M::lock(&self.can_tx).await.transmit(&frame).await
     }
 
     async fn send_sdo_download_segment(
@@ -540,7 +565,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         payload[1..1 + segment_data.len()].copy_from_slice(segment_data);
 
         let frame = FRAME::new(Id::Standard(StandardId::new(id).unwrap()), &payload).unwrap();
-        self.can_tx.lock().await.transmit(&frame).await
+        M::lock(&self.can_tx).await.transmit(&frame).await
     }
 
     async fn send_sdo_request_upload_segment(&self, toggle: bool) -> Result<(), TX::Error> {
@@ -549,6 +574,6 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         // Upload SDO Segment Request: 011t 0000 b
         payload[0] = 0x60 | if toggle { 0x10 } else { 0x00 };
         let frame = FRAME::new(Id::Standard(StandardId::new(id).unwrap()), &payload).unwrap();
-        self.can_tx.lock().await.transmit(&frame).await
+        M::lock(&self.can_tx).await.transmit(&frame).await
     }
 }
