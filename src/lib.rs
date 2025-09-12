@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(async_fn_in_trait)]
 
 use core::cell::RefCell;
 use crc::{Algorithm, Crc};
@@ -18,6 +19,7 @@ pub enum SdoError<E> {
     SdoAbort(u32),
     BufferSizeWrong,
     InvalidNodeId,
+    StreamError,
 }
 
 #[cfg(feature = "defmt")]
@@ -31,7 +33,41 @@ impl<E> defmt::Format for SdoError<E> {
             SdoError::TxError(_) => defmt::write!(f, "TxError"),
             SdoError::BufferSizeWrong => defmt::write!(f, "BufferSizeWrong"),
             SdoError::InvalidNodeId => defmt::write!(f, "InvalidNodeId"),
+            SdoError::StreamError => defmt::write!(f, "StreamError"),
         }
+    }
+}
+
+/// Position from which to seek.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeekFrom {
+    /// Seek from the beginning of the stream.
+    Start(u64),
+    /// Seek from the end of the stream.
+    End(i64),
+    /// Seek from the current position.
+    Current(i64),
+}
+
+/// A trait for reading data in chunks for SDO block downloads.
+pub trait StreamReader<E> {
+    /// Reads the next chunk of data into the buffer.
+    ///
+    /// Returns the number of bytes read. A return value of 0 indicates the end of the stream.
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, SdoError<E>>;
+}
+
+/// A trait for seeking within a stream.
+pub trait StreamSeeker<E> {
+    /// Seek to a new position in the stream.
+    ///
+    /// Returns the new position from the start of the stream.
+    async fn seek(&mut self, pos: SeekFrom) -> Result<u64, SdoError<E>>;
+
+    /// Returns the current position of the stream.
+    /// This is equivalent to `seek(SeekFrom::Current(0))`.
+    async fn stream_position(&mut self) -> Result<u64, SdoError<E>> {
+        self.seek(SeekFrom::Current(0)).await
     }
 }
 
@@ -227,15 +263,16 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         self.read_block_locked(index, sub, buf).await
     }
 
-    pub async fn write_block(
+    pub async fn write_block<S: StreamReader<TX::Error> + StreamSeeker<TX::Error>>(
         &self,
         index: u16,
         sub: u8,
-        data: &[u8],
+        stream: &mut S,
+        size: u32,
         request_crc_support: bool,
     ) -> Result<(), SdoError<TX::Error>> {
         let _guard = self.request_lock.lock().await;
-        self.write_block_locked(index, sub, data, request_crc_support)
+        self.write_block_locked(index, sub, stream, size, request_crc_support)
             .await
     }
 
@@ -515,11 +552,12 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         unimplemented!("SDO Block Read is not yet implemented");
     }
 
-    async fn write_block_locked(
+    async fn write_block_locked<S: StreamReader<TX::Error> + StreamSeeker<TX::Error>>(
         &self,
         index: u16,
         sub: u8,
-        data: &[u8],
+        stream: &mut S,
+        size: u32,
         request_crc_support: bool,
     ) -> Result<(), SdoError<TX::Error>> {
         const XMODEM: Crc<u16> = Crc::<u16>::new(&Algorithm {
@@ -539,7 +577,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         let _guard = PendingGuard::new(&self.state.pending);
         self.state.sig_block_init.reset();
 
-        self.send_initiate_block_download(index, sub, data.len() as u32, request_crc_support)
+        self.send_initiate_block_download(index, sub, size, request_crc_support)
             .await
             .map_err(SdoError::TxError)?;
 
@@ -559,32 +597,41 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
 
         // --- Main Loop: Send sub-blocks ---
         let mut offset = 0usize;
+        let mut chunk_buf = [0u8; 7];
 
-        while offset < data.len() {
+        while offset < size as usize {
             // --- Send one sub-block ---
             let sub_block_start_offset = offset;
             let mut last_sent_seqno_in_block = 0;
 
             for seqno in 1..=blksize {
-                let chunk_end = (offset + 7).min(data.len());
-                let chunk = &data[offset..chunk_end];
+                let bytes_read = stream.read(&mut chunk_buf).await?;
+                if bytes_read == 0 {
+                    // End of stream reached. Should only happen if provided `size` was wrong.
+                    break;
+                }
+                let chunk = &chunk_buf[..bytes_read];
 
                 if use_crc {
                     crc_digest.update(chunk);
                 }
 
-                let last_segment_of_transfer = chunk_end == data.len();
+                offset += bytes_read;
+                last_sent_seqno_in_block = seqno;
+                let last_segment_of_transfer = offset == size as usize;
 
                 self.send_block_download_segment(chunk, seqno, last_segment_of_transfer)
                     .await
                     .map_err(SdoError::TxError)?;
 
-                offset = chunk_end;
-                last_sent_seqno_in_block = seqno;
-
                 if last_segment_of_transfer {
                     break;
                 }
+            }
+
+            // If nothing was sent in this sub-block, break the main loop.
+            if last_sent_seqno_in_block == 0 {
+                break;
             }
 
             // --- Await sub-block acknowledgement ---
@@ -616,23 +663,41 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                 } else {
                     // Retransmission needed
                     let retransmit_start_offset = sub_block_start_offset + (ackseq as usize * 7);
-                    let mut retransmit_offset = retransmit_start_offset;
 
-                    for i in 0..(last_sent_seqno_in_block - ackseq) {
-                        let retransmit_seqno = ackseq + 1 + i;
-                        let chunk_end = (retransmit_offset + 7).min(data.len());
-                        let chunk = &data[retransmit_offset..chunk_end];
-                        let is_last = chunk_end == data.len();
+                    // Seek to the point where retransmission should start
+                    stream
+                        .seek(SeekFrom::Start(retransmit_start_offset as u64))
+                        .await?;
 
-                        self.send_block_download_segment(chunk, retransmit_seqno, is_last)
+                    let mut retransmit_buf = [0u8; 7];
+
+                    for seqno_to_resend in (ackseq + 1)..=last_sent_seqno_in_block {
+                        let bytes_read = stream.read(&mut retransmit_buf).await?;
+
+                        if bytes_read == 0 {
+                            // This would be an error, stream ended prematurely
+                            break;
+                        }
+                        let chunk = &retransmit_buf[..bytes_read];
+
+                        // Calculate the "current" offset for the purpose of checking if this is the last segment
+                        let retransmitted_bytes_count =
+                            ((seqno_to_resend - ackseq - 1) as usize * 7) + bytes_read;
+                        let current_retransmit_stream_pos =
+                            retransmit_start_offset + retransmitted_bytes_count;
+
+                        let is_last = current_retransmit_stream_pos == size as usize;
+
+                        self.send_block_download_segment(chunk, seqno_to_resend, is_last)
                             .await
                             .map_err(SdoError::TxError)?;
 
-                        retransmit_offset = chunk_end;
                         if is_last {
                             break;
                         }
                     }
+                    // After re-reading and sending the failed segments, the stream cursor is now at the correct position
+                    // to continue with the next block, so no need to seek back.
                 }
             }
         }
@@ -644,10 +709,10 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
             0x0000
         };
 
-        let unused_bytes_in_last_segment = if data.is_empty() {
+        let unused_bytes_in_last_segment = if size == 0 {
             7
         } else {
-            let last_segment_len = (data.len() - 1) % 7 + 1;
+            let last_segment_len = (size as usize - 1) % 7 + 1;
             (7 - last_segment_len) as u8
         };
 
