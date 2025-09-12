@@ -609,7 +609,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
 
         while offset < size as usize {
             // --- Send one sub-block ---
-            let sub_block_start_offset = stream.stream_position().await? as usize;
+            let sub_block_start_offset = offset;
             let mut last_sent_seqno_in_block = 0;
 
             for seqno in 1..=blksize {
@@ -687,9 +687,13 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                         }
                         let chunk = &retransmit_buf[..bytes_read];
 
-                        // Get the definitive current position from the stream itself
-                        let current_pos = stream.stream_position().await?;
-                        let is_last = current_pos == size as u64;
+                        // Calculate the "current" offset for the purpose of checking if this is the last segment
+                        let retransmitted_bytes_count =
+                            ((seqno_to_resend - ackseq - 1) as usize * 7) + bytes_read;
+                        let current_retransmit_stream_pos =
+                            retransmit_start_offset + retransmitted_bytes_count;
+
+                        let is_last = current_retransmit_stream_pos == size as usize;
 
                         self.send_block_download_segment(chunk, seqno_to_resend, is_last)
                             .await
