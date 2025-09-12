@@ -216,6 +216,14 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         }
     }
 
+    pub async fn send_nmt_reset_node(&self) -> Result<(), TX::Error> {
+        const NMT_CMD_RESET_NODE: u8 = 0x81;
+        let nmt_id = StandardId::new(0x000).unwrap();
+        let payload = [NMT_CMD_RESET_NODE, self.node_id];
+        let frame = FRAME::new(Id::Standard(nmt_id), &payload).unwrap();
+        self.can_tx.lock().await.transmit(&frame).await
+    }
+
     pub async fn read_expedited(&self, index: u16, sub: u8) -> Result<u32, SdoError<TX::Error>> {
         let _guard = self.request_lock.lock().await;
         self.read_expedited_locked(index, sub).await
