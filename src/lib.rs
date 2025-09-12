@@ -609,14 +609,14 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
 
         while offset < size as usize {
             // --- Send one sub-block ---
-            let sub_block_start_offset = offset;
+            let sub_block_start_offset = stream.stream_position().await? as usize;
             let mut last_sent_seqno_in_block = 0;
 
             for seqno in 1..=blksize {
                 let bytes_read = stream.read(&mut chunk_buf).await?;
                 if bytes_read == 0 {
-                    // End of stream reached. Should only happen if provided `size` was wrong.
-                    break;
+                    // The stream ended before the promised `size` was delivered. This is an error.
+                    return Err(SdoError::StreamError);
                 }
                 let chunk = &chunk_buf[..bytes_read];
 
@@ -681,20 +681,15 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
 
                     for seqno_to_resend in (ackseq + 1)..=last_sent_seqno_in_block {
                         let bytes_read = stream.read(&mut retransmit_buf).await?;
-
                         if bytes_read == 0 {
-                            // This would be an error, stream ended prematurely
-                            break;
+                            // Stream ended prematurely during retransmission
+                            return Err(SdoError::StreamError);
                         }
                         let chunk = &retransmit_buf[..bytes_read];
 
-                        // Calculate the "current" offset for the purpose of checking if this is the last segment
-                        let retransmitted_bytes_count =
-                            ((seqno_to_resend - ackseq - 1) as usize * 7) + bytes_read;
-                        let current_retransmit_stream_pos =
-                            retransmit_start_offset + retransmitted_bytes_count;
-
-                        let is_last = current_retransmit_stream_pos == size as usize;
+                        // Get the definitive current position from the stream itself
+                        let current_pos = stream.stream_position().await?;
+                        let is_last = current_pos == size as u64;
 
                         self.send_block_download_segment(chunk, seqno_to_resend, is_last)
                             .await
@@ -704,8 +699,6 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                             break;
                         }
                     }
-                    // After re-reading and sending the failed segments, the stream cursor is now at the correct position
-                    // to continue with the next block, so no need to seek back.
                 }
             }
         }
