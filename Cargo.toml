@@ -6,9 +6,11 @@ edition = "2024"
 
 [dependencies]
 crc = "3.3.0"
+defmt = { version = "1.0.1", optional = true }
 embassy-sync = "0.7.2"
 embassy-time = "0.5.0"
 embedded-can = { version = "0.4.1", git = "https://github.com/swobbee-dev/embedded-hal", branch = "feature/embedded-can-async", package = "embedded-can" }
 
 [features]
-defmt = []
+default = ["defmt"]
+defmt = ["dep:defmt"]
