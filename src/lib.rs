@@ -8,6 +8,8 @@ use embassy_time::Duration;
 use embedded_can::{Frame, Id, StandardId, asynch::CanTx};
 
 const ABORT_INVALID_BLOCK_SIZE: u32 = 0x05040002;
+const ABORT_SEQ_NUM_ERROR: u32 = 0x05040003;
+const ABORT_CRC_ERROR: u32 = 0x05040004;
 
 #[allow(dead_code)]
 #[derive(Debug, PartialEq)]
@@ -86,6 +88,9 @@ struct RequestState<FRAME, TX: CanTx<Frame = FRAME>> {
     sig_ack: Signal<NoopRawMutex, Result<(), SdoError<TX::Error>>>,
     sig_block_init: Signal<NoopRawMutex, Result<BlockInit, SdoError<TX::Error>>>,
     sig_block_ack: Signal<NoopRawMutex, Result<BlockAck, SdoError<TX::Error>>>,
+    sig_block_upload_init: Signal<NoopRawMutex, Result<BlockUploadInit, SdoError<TX::Error>>>,
+    sig_block_upload_seg: Signal<NoopRawMutex, Result<BlockUploadSegment, SdoError<TX::Error>>>,
+    sig_block_upload_end: Signal<NoopRawMutex, Result<u16, SdoError<TX::Error>>>,
 }
 
 enum SdoRequest<'a> {
@@ -123,6 +128,9 @@ enum Pending {
     BlockDownloadInitiate { index: u16, sub: u8 },
     BlockDownloadAck,
     BlockDownloadEnd,
+    BlockUploadInitiate { index: u16, sub: u8 },
+    BlockUploadActive,
+    BlockUploadEndWait,
 }
 
 #[derive(Copy, Clone)]
@@ -140,6 +148,19 @@ pub struct BlockInit {
 pub struct BlockAck {
     ackseq: u8,
     next_blksize: u8,
+}
+
+pub struct BlockUploadInit {
+    size: u32,
+    server_supports_crc: bool,
+}
+
+#[derive(Copy, Clone)]
+pub struct BlockUploadSegment {
+    last: bool,
+    seqno: u8,
+    len: usize,
+    data: [u8; 7],
 }
 
 struct PendingGuard<'a> {
@@ -172,6 +193,9 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                 sig_ack: Signal::new(),
                 sig_block_init: Signal::new(),
                 sig_block_ack: Signal::new(),
+                sig_block_upload_init: Signal::new(),
+                sig_block_upload_seg: Signal::new(),
+                sig_block_upload_end: Signal::new(),
             },
             can_tx: Mutex::new(tx),
             timeout,
@@ -260,15 +284,16 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         self.write_segmented_locked(index, sub, data).await
     }
 
-    #[allow(dead_code)]
     pub async fn read_block(
         &self,
         index: u16,
         sub: u8,
         buf: &mut [u8],
+        request_crc_support: bool,
     ) -> Result<(), SdoError<TX::Error>> {
         let _guard = self.request_lock.lock().await;
-        self.read_block_locked(index, sub, buf).await
+        self.read_block_locked(index, sub, buf, request_crc_support)
+            .await
     }
 
     pub async fn write_block<S: StreamReader<TX::Error> + StreamSeeker<TX::Error>>(
@@ -443,6 +468,74 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                     self.state.sig_ack.signal(Err(SdoError::InvalidResponse));
                 }
             }
+
+            Pending::BlockUploadInitiate { index, sub } => {
+                // Response to initiate block upload: cs = 11000rs0b
+                if (command & 0b1111_1001) == 0b1100_0000 {
+                    let response_index = u16::from_le_bytes(frame.data()[1..3].try_into().unwrap());
+                    let response_sub = frame.data()[3];
+                    if response_index != index || response_sub != sub {
+                        self.state
+                            .sig_block_upload_init
+                            .signal(Err(SdoError::InvalidResponse));
+                        return;
+                    }
+
+                    let server_supports_crc = (command & 0b0000_0100) != 0;
+                    let size_indicated = (command & 0b0000_0010) != 0;
+
+                    let size = if size_indicated {
+                        u32::from_le_bytes(frame.data()[4..8].try_into().unwrap())
+                    } else {
+                        0
+                    };
+
+                    self.state.sig_block_upload_init.signal(Ok(BlockUploadInit {
+                        size,
+                        server_supports_crc,
+                    }));
+                } else {
+                    self.state
+                        .sig_block_upload_init
+                        .signal(Err(SdoError::InvalidResponse));
+                }
+            }
+
+            Pending::BlockUploadActive => {
+                // Must be an upload segment: cs = c nnnnnnnb
+                let seqno = command & 0x7F;
+                if seqno > 0 && seqno <= 127 {
+                    let last = (command & 0x80) != 0;
+                    let len = 7;
+                    let mut data = [0u8; 7];
+                    data.copy_from_slice(&frame.data()[1..8]);
+
+                    let segment = BlockUploadSegment {
+                        last,
+                        seqno,
+                        len,
+                        data,
+                    };
+
+                    self.state.sig_block_upload_seg.signal(Ok(segment));
+                } else {
+                    self.state
+                        .sig_block_upload_seg
+                        .signal(Err(SdoError::InvalidResponse));
+                }
+            }
+
+            Pending::BlockUploadEndWait => {
+                // Must be the end of upload frame from server: cs = 110nnn01b
+                if (command & 0b11100011) == 0b11000001 {
+                    let crc = u16::from_le_bytes(frame.data()[1..3].try_into().unwrap());
+                    self.state.sig_block_upload_end.signal(Ok(crc));
+                } else {
+                    self.state
+                        .sig_block_upload_end
+                        .signal(Err(SdoError::InvalidResponse));
+                }
+            }
         };
     }
 
@@ -553,11 +646,143 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
 
     async fn read_block_locked(
         &self,
-        _index: u16,
-        _sub: u8,
-        _buf: &mut [u8],
+        index: u16,
+        sub: u8,
+        buf: &mut [u8],
+        request_crc_support: bool,
     ) -> Result<(), SdoError<TX::Error>> {
-        unimplemented!("SDO Block Read is not yet implemented");
+        const XMODEM: Crc<u16> = Crc::<u16>::new(&Algorithm {
+            width: 16,
+            poly: 0x1021,
+            init: 0x0000,
+            refin: false,
+            refout: false,
+            xorout: 0x0000,
+            check: 0x31C3,
+            residue: 0x0000,
+        });
+        let mut crc_digest = XMODEM.digest();
+
+        // --- 1. Initiate Block Upload ---
+        *self.state.pending.borrow_mut() = Some(Pending::BlockUploadInitiate { index, sub });
+        let _guard = PendingGuard::new(&self.state.pending);
+        self.state.sig_block_upload_init.reset();
+
+        // The client proposes a block size. 127 is the max.
+        let client_blksize: u8 = 127;
+
+        self.send_initiate_block_upload(index, sub, client_blksize, request_crc_support)
+            .await
+            .map_err(SdoError::TxError)?;
+
+        let BlockUploadInit {
+            size,
+            server_supports_crc,
+        } = match embassy_time::with_timeout(self.timeout, self.state.sig_block_upload_init.wait())
+            .await
+        {
+            Ok(res) => res?,
+            Err(_) => return Err(SdoError::Timeout),
+        };
+
+        if size as usize > buf.len() {
+            return Err(SdoError::BufferSizeWrong);
+        }
+
+        let use_crc = request_crc_support && server_supports_crc;
+
+        // --- 2. Start Upload ---
+        self.send_start_block_upload()
+            .await
+            .map_err(SdoError::TxError)?;
+
+        // --- 3. Main Loop: Receive sub-blocks ---
+        let mut offset = 0usize;
+        let mut transfer_complete = size == 0;
+
+        while !transfer_complete {
+            let mut last_received_seqno = 0;
+
+            // --- Receive one sub-block ---
+            for expected_seqno in 1..=client_blksize {
+                *self.state.pending.borrow_mut() = Some(Pending::BlockUploadActive);
+                self.state.sig_block_upload_seg.reset();
+
+                let segment = match embassy_time::with_timeout(
+                    self.timeout,
+                    self.state.sig_block_upload_seg.wait(),
+                )
+                .await
+                {
+                    Ok(res) => res?,
+                    Err(_) => return Err(SdoError::Timeout),
+                };
+
+                if segment.seqno != expected_seqno {
+                    return Err(SdoError::SdoAbort(ABORT_SEQ_NUM_ERROR));
+                }
+
+                let data_len = if size > 0 && (offset + segment.len) > size as usize {
+                    size as usize - offset
+                } else {
+                    // When size is unknown (0), we must rely on the segment data length
+                    segment.len
+                };
+
+                if offset + data_len > buf.len() {
+                    return Err(SdoError::BufferSizeWrong);
+                }
+
+                buf[offset..offset + data_len].copy_from_slice(&segment.data[..data_len]);
+
+                if use_crc {
+                    crc_digest.update(&buf[offset..offset + data_len]);
+                }
+
+                offset += data_len;
+                last_received_seqno = segment.seqno;
+
+                if segment.last {
+                    transfer_complete = true;
+                    break; // Exit sub-block loop
+                }
+                if offset as u32 >= size {
+                    transfer_complete = true;
+                    break;
+                }
+            }
+
+            // --- 4. Acknowledge sub-block ---
+            self.send_block_upload_ack(last_received_seqno, client_blksize)
+                .await
+                .map_err(SdoError::TxError)?;
+        }
+
+        // --- 5. Wait for End of Transfer frame from Server ---
+        *self.state.pending.borrow_mut() = Some(Pending::BlockUploadEndWait);
+        self.state.sig_block_upload_end.reset();
+
+        let server_crc =
+            match embassy_time::with_timeout(self.timeout, self.state.sig_block_upload_end.wait())
+                .await
+            {
+                Ok(res) => res?,
+                Err(_) => return Err(SdoError::Timeout),
+            };
+
+        // --- 6. Validate CRC and send final confirmation ---
+        if use_crc {
+            let client_crc = crc_digest.finalize();
+            if client_crc != server_crc {
+                return Err(SdoError::SdoAbort(ABORT_CRC_ERROR));
+            }
+        }
+
+        self.send_end_block_upload_confirmation()
+            .await
+            .map_err(SdoError::TxError)?;
+
+        Ok(())
     }
 
     async fn write_block_locked<S: StreamReader<TX::Error> + StreamSeeker<TX::Error>>(
@@ -746,6 +971,11 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
             Pending::UploadSegment { .. } => self.state.sig_seg.signal(Err(err)),
             Pending::BlockDownloadInitiate { .. } => self.state.sig_block_init.signal(Err(err)),
             Pending::BlockDownloadAck => self.state.sig_block_ack.signal(Err(err)),
+            Pending::BlockUploadInitiate { .. } => {
+                self.state.sig_block_upload_init.signal(Err(err))
+            }
+            Pending::BlockUploadActive => self.state.sig_block_upload_seg.signal(Err(err)),
+            Pending::BlockUploadEndWait => self.state.sig_block_upload_end.signal(Err(err)),
         }
     }
 
@@ -891,6 +1121,62 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
 
         payload[0] = cs;
         payload[1..3].copy_from_slice(&crc.to_le_bytes());
+
+        let frame = FRAME::new(Id::Standard(StandardId::new(id).unwrap()), &payload).unwrap();
+        self.can_tx.lock().await.transmit(&frame).await
+    }
+
+    async fn send_initiate_block_upload(
+        &self,
+        index: u16,
+        sub: u8,
+        blksize: u8,
+        crc: bool,
+    ) -> Result<(), TX::Error> {
+        let id = 0x600 + (self.node_id as u16);
+        let mut payload = [0u8; 8];
+        // Initiate block upload CS: 10100r00b
+        let mut cs = 0b1010_0000;
+        if crc {
+            cs |= 0b0000_0100; // r bit (CRC support)
+        }
+
+        payload[0] = cs;
+        payload[1..3].copy_from_slice(&index.to_le_bytes());
+        payload[3] = sub;
+        payload[4] = blksize;
+
+        let frame = FRAME::new(Id::Standard(StandardId::new(id).unwrap()), &payload).unwrap();
+        self.can_tx.lock().await.transmit(&frame).await
+    }
+
+    async fn send_start_block_upload(&self) -> Result<(), TX::Error> {
+        let id = 0x600 + (self.node_id as u16);
+        let mut payload = [0u8; 8];
+        // Start upload CS: 10100011b
+        payload[0] = 0xA3;
+
+        let frame = FRAME::new(Id::Standard(StandardId::new(id).unwrap()), &payload).unwrap();
+        self.can_tx.lock().await.transmit(&frame).await
+    }
+
+    async fn send_block_upload_ack(&self, ackseq: u8, blksize: u8) -> Result<(), TX::Error> {
+        let id = 0x600 + (self.node_id as u16);
+        let mut payload = [0u8; 8];
+        // Upload sub-block response CS: 10100010b
+        payload[0] = 0xA2;
+        payload[1] = ackseq;
+        payload[2] = blksize;
+
+        let frame = FRAME::new(Id::Standard(StandardId::new(id).unwrap()), &payload).unwrap();
+        self.can_tx.lock().await.transmit(&frame).await
+    }
+
+    async fn send_end_block_upload_confirmation(&self) -> Result<(), TX::Error> {
+        let id = 0x600 + (self.node_id as u16);
+        let mut payload = [0u8; 8];
+        // Upload end response CS: 10100001b
+        payload[0] = 0xA1;
 
         let frame = FRAME::new(Id::Standard(StandardId::new(id).unwrap()), &payload).unwrap();
         self.can_tx.lock().await.transmit(&frame).await
