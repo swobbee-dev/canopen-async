@@ -3,7 +3,9 @@
 
 use core::cell::RefCell;
 use crc::{Algorithm, Crc};
-use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex, signal::Signal};
+use embassy_sync::{
+    blocking_mutex::raw::NoopRawMutex, channel::Channel, mutex::Mutex, signal::Signal,
+};
 use embassy_time::Duration;
 use embedded_can::{Frame, Id, StandardId, asynch::CanTx};
 
@@ -81,6 +83,9 @@ pub struct SdoClient<FRAME, TX: CanTx<Frame = FRAME>> {
     timeout: Duration,
 }
 
+// A queue size of 4 should be sufficient for most CAN bus conditions.
+const BLOCK_SEGMENT_QUEUE_SIZE: usize = 4;
+
 struct RequestState<FRAME, TX: CanTx<Frame = FRAME>> {
     pending: RefCell<Option<Pending>>,
     sig_word: Signal<NoopRawMutex, Result<u32, SdoError<TX::Error>>>,
@@ -89,7 +94,11 @@ struct RequestState<FRAME, TX: CanTx<Frame = FRAME>> {
     sig_block_init: Signal<NoopRawMutex, Result<BlockInit, SdoError<TX::Error>>>,
     sig_block_ack: Signal<NoopRawMutex, Result<BlockAck, SdoError<TX::Error>>>,
     sig_block_upload_init: Signal<NoopRawMutex, Result<BlockUploadInit, SdoError<TX::Error>>>,
-    sig_block_upload_seg: Signal<NoopRawMutex, Result<BlockUploadSegment, SdoError<TX::Error>>>,
+    block_upload_seg_chan: Channel<
+        NoopRawMutex,
+        Result<BlockUploadSegment, SdoError<TX::Error>>,
+        BLOCK_SEGMENT_QUEUE_SIZE,
+    >,
     sig_block_upload_end: Signal<NoopRawMutex, Result<u16, SdoError<TX::Error>>>,
 }
 
@@ -119,6 +128,7 @@ enum SdoRequest<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 enum Pending {
     ExpeditedRead { index: u16, sub: u8 },
     ExpeditedWrite { index: u16, sub: u8 },
@@ -134,28 +144,34 @@ enum Pending {
 }
 
 #[derive(Copy, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Segment {
     last: bool,
     len: usize,
     data: [u8; 7],
 }
 
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct BlockInit {
     blksize: u8,
     server_supports_crc: bool,
 }
 
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct BlockAck {
     ackseq: u8,
     next_blksize: u8,
 }
 
+#[derive(Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct BlockUploadInit {
-    size: u32,
+    size: Option<u32>,
     server_supports_crc: bool,
 }
 
 #[derive(Copy, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct BlockUploadSegment {
     last: bool,
     seqno: u8,
@@ -194,7 +210,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                 sig_block_init: Signal::new(),
                 sig_block_ack: Signal::new(),
                 sig_block_upload_init: Signal::new(),
-                sig_block_upload_seg: Signal::new(),
+                block_upload_seg_chan: Channel::new(),
                 sig_block_upload_end: Signal::new(),
             },
             can_tx: Mutex::new(tx),
@@ -318,7 +334,22 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
             return; // Not an SDO response for this node
         }
 
-        let Some(pending_request) = self.state.pending.borrow_mut().take() else {
+        // For BlockUploadActive, we peek instead of taking, to avoid race conditions.
+        let mut is_block_upload_active = false;
+        if let Some(Pending::BlockUploadActive) = *self.state.pending.borrow() {
+            is_block_upload_active = true;
+        }
+
+        let pending_request = if !is_block_upload_active {
+            self.state.pending.borrow_mut().take()
+        } else {
+            // It's a block upload segment, just peek at the state.
+            // The state will be consumed later if it's the `last` segment.
+            *self.state.pending.borrow()
+        };
+
+        let Some(pending_request) = pending_request else {
+            // This can happen if a frame arrives after a timeout but before the guard is dropped
             return;
         };
 
@@ -359,7 +390,6 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                         let size = u32::from_le_bytes(frame.data()[4..8].try_into().unwrap());
                         self.state.sig_word.signal(Ok(size));
                     }
-                    // Any other command is invalid for this state.
                     _ => {
                         self.state.sig_word.signal(Err(SdoError::InvalidResponse));
                     }
@@ -375,7 +405,6 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                     return;
                 }
 
-                // The only valid response is a download confirmation.
                 if command == 0x60 {
                     self.state.sig_ack.signal(Ok(()));
                 } else {
@@ -431,10 +460,11 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                     let blksize = frame.data()[4];
                     let server_supports_crc = (command & 0b0000_0100) != 0;
 
-                    self.state.sig_block_init.signal(Ok(BlockInit {
+                    let block_init = BlockInit {
                         blksize,
                         server_supports_crc,
-                    }));
+                    };
+                    self.state.sig_block_init.signal(Ok(block_init));
                 } else {
                     self.state
                         .sig_block_init
@@ -445,13 +475,13 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
             Pending::BlockDownloadAck => {
                 // Response to sub-block: cs = 10100010b
                 if command == 0xA2 {
-                    // 10100010b
                     let ackseq = frame.data()[1];
                     let next_blksize = frame.data()[2];
-                    self.state.sig_block_ack.signal(Ok(BlockAck {
+                    let block_ack = BlockAck {
                         ackseq,
                         next_blksize,
-                    }));
+                    };
+                    self.state.sig_block_ack.signal(Ok(block_ack));
                 } else {
                     self.state
                         .sig_block_ack
@@ -485,15 +515,16 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                     let size_indicated = (command & 0b0000_0010) != 0;
 
                     let size = if size_indicated {
-                        u32::from_le_bytes(frame.data()[4..8].try_into().unwrap())
+                        Some(u32::from_le_bytes(frame.data()[4..8].try_into().unwrap()))
                     } else {
-                        0
+                        None
                     };
 
-                    self.state.sig_block_upload_init.signal(Ok(BlockUploadInit {
+                    let upload_init = BlockUploadInit {
                         size,
                         server_supports_crc,
-                    }));
+                    };
+                    self.state.sig_block_upload_init.signal(Ok(upload_init));
                 } else {
                     self.state
                         .sig_block_upload_init
@@ -502,7 +533,6 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
             }
 
             Pending::BlockUploadActive => {
-                // Must be an upload segment: cs = c nnnnnnnb
                 let seqno = command & 0x7F;
                 if seqno > 0 && seqno <= 127 {
                     let last = (command & 0x80) != 0;
@@ -517,11 +547,29 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                         data,
                     };
 
-                    self.state.sig_block_upload_seg.signal(Ok(segment));
+                    if self
+                        .state
+                        .block_upload_seg_chan
+                        .try_send(Ok(segment))
+                        .is_err()
+                    {
+                        // This can happen if the server sends faster than the client task consumes.
+                        // We drop the segment; the client task will eventually time out and abort.
+                    }
+
+                    // If it was the last segment of the whole transfer, consume the pending state.
+                    if last {
+                        *self.state.pending.borrow_mut() = None;
+                    }
                 } else {
-                    self.state
-                        .sig_block_upload_seg
-                        .signal(Err(SdoError::InvalidResponse));
+                    if self
+                        .state
+                        .block_upload_seg_chan
+                        .try_send(Err(SdoError::InvalidResponse))
+                        .is_err()
+                    {
+                        // queue is full, dropping error.
+                    }
                 }
             }
 
@@ -685,10 +733,11 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
             Err(_) => return Err(SdoError::Timeout),
         };
 
-        if size as usize > buf.len() {
-            return Err(SdoError::BufferSizeWrong);
+        if let Some(s) = size {
+            if s as usize > buf.len() {
+                return Err(SdoError::BufferSizeWrong);
+            }
         }
-
         let use_crc = request_crc_support && server_supports_crc;
 
         // --- 2. Start Upload ---
@@ -698,19 +747,20 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
 
         // --- 3. Main Loop: Receive sub-blocks ---
         let mut offset = 0usize;
-        let mut transfer_complete = size == 0;
+        let mut transfer_complete = matches!(size, Some(0));
+
+        // Clear any stale segments from a previous failed run
+        while self.state.block_upload_seg_chan.try_receive().is_ok() {}
 
         while !transfer_complete {
             let mut last_received_seqno = 0;
-
             // --- Receive one sub-block ---
             for expected_seqno in 1..=client_blksize {
                 *self.state.pending.borrow_mut() = Some(Pending::BlockUploadActive);
-                self.state.sig_block_upload_seg.reset();
 
                 let segment = match embassy_time::with_timeout(
                     self.timeout,
-                    self.state.sig_block_upload_seg.wait(),
+                    self.state.block_upload_seg_chan.receive(),
                 )
                 .await
                 {
@@ -722,16 +772,13 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                     return Err(SdoError::SdoAbort(ABORT_SEQ_NUM_ERROR));
                 }
 
-                let data_len = if size > 0 && (offset + segment.len) > size as usize {
-                    size as usize - offset
-                } else {
-                    // When size is unknown (0), we must rely on the segment data length
-                    segment.len
-                };
-
-                if offset + data_len > buf.len() {
-                    return Err(SdoError::BufferSizeWrong);
+                let mut data_len = segment.len;
+                if let Some(s) = size {
+                    let remaining_bytes = (s as usize).saturating_sub(offset);
+                    data_len = data_len.min(remaining_bytes);
                 }
+                let remaining_buf_space = buf.len().saturating_sub(offset);
+                data_len = data_len.min(remaining_buf_space);
 
                 buf[offset..offset + data_len].copy_from_slice(&segment.data[..data_len]);
 
@@ -744,11 +791,13 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
 
                 if segment.last {
                     transfer_complete = true;
-                    break; // Exit sub-block loop
-                }
-                if offset as u32 >= size {
-                    transfer_complete = true;
                     break;
+                }
+                if let Some(s) = size {
+                    if offset as u32 >= s {
+                        transfer_complete = true;
+                        break;
+                    }
                 }
             }
 
@@ -912,7 +961,6 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                         }
                         let chunk = &retransmit_buf[..bytes_read];
 
-                        // Calculate the "current" offset for the purpose of checking if this is the last segment
                         let retransmitted_bytes_count =
                             ((seqno_to_resend - ackseq - 1) as usize * 7) + bytes_read;
                         let current_retransmit_stream_pos =
@@ -974,7 +1022,11 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
             Pending::BlockUploadInitiate { .. } => {
                 self.state.sig_block_upload_init.signal(Err(err))
             }
-            Pending::BlockUploadActive => self.state.sig_block_upload_seg.signal(Err(err)),
+            Pending::BlockUploadActive => {
+                if self.state.block_upload_seg_chan.try_send(Err(err)).is_err() {
+                    // queue is full, dropping error.
+                }
+            }
             Pending::BlockUploadEndWait => self.state.sig_block_upload_end.signal(Err(err)),
         }
     }
