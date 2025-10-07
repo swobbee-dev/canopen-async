@@ -13,6 +13,14 @@ const ABORT_INVALID_BLOCK_SIZE: u32 = 0x05040002;
 const ABORT_SEQ_NUM_ERROR: u32 = 0x05040003;
 const ABORT_CRC_ERROR: u32 = 0x05040004;
 
+// CiA 301 Version 4.2.0, page 72ff
+// cs: command specifier
+const NMT_CS_START: u8 = 1;
+const NMT_CS_STOP: u8 = 2;
+const NMT_CS_ENTER_PRE_OPERATIONAL: u8 = 128;
+const NMT_CS_RESET_NODE: u8 = 129;
+const NMT_CS_RESET_COMMUNICATION: u8 = 130;
+
 #[allow(dead_code)]
 #[derive(Debug, PartialEq)]
 pub enum SdoError<E> {
@@ -256,12 +264,32 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         }
     }
 
-    pub async fn send_nmt_reset_node(&self) -> Result<(), TX::Error> {
-        const NMT_CMD_RESET_NODE: u8 = 0x81;
+    pub async fn send_nmt(&self, cs: u8) -> Result<(), TX::Error> {
+        // cs: command specifier
         let nmt_id = StandardId::new(0x000).unwrap();
-        let payload = [NMT_CMD_RESET_NODE, self.node_id];
+        let payload = [cs, self.node_id];
         let frame = FRAME::new(Id::Standard(nmt_id), &payload).unwrap();
         self.can_tx.lock().await.transmit(&frame).await
+    }
+
+    pub async fn send_nmt_start_node(&self) -> Result<(), TX::Error> {
+        self.send_nmt(NMT_CS_START).await
+    }
+
+    pub async fn send_nmt_stop_node(&self) -> Result<(), TX::Error> {
+        self.send_nmt(NMT_CS_STOP).await
+    }
+
+    pub async fn send_nmt_enter_pre_operational(&self) -> Result<(), TX::Error> {
+        self.send_nmt(NMT_CS_ENTER_PRE_OPERATIONAL).await
+    }
+
+    pub async fn send_nmt_reset_node(&self) -> Result<(), TX::Error> {
+        self.send_nmt(NMT_CS_RESET_NODE).await
+    }
+
+    pub async fn send_nmt_reset_communication(&self) -> Result<(), TX::Error> {
+        self.send_nmt(NMT_CS_RESET_COMMUNICATION).await
     }
 
     pub async fn read_expedited(&self, index: u16, sub: u8) -> Result<u32, SdoError<TX::Error>> {
