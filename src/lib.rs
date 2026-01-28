@@ -29,6 +29,7 @@ pub enum SdoError<E> {
     TxError(E),
     InvalidResponse,
     SdoAbort(u32),
+    RetransmissionLimit(u32),
     BufferSizeWrong,
     InvalidNodeId,
     StreamError,
@@ -42,6 +43,9 @@ impl<E> defmt::Format for SdoError<E> {
             SdoError::RequestPending => defmt::write!(f, "RequestPending"),
             SdoError::InvalidResponse => defmt::write!(f, "InvalidResponse"),
             SdoError::SdoAbort(code) => defmt::write!(f, "SdoAbort(0x{:08X})", code),
+            SdoError::RetransmissionLimit(retries) => {
+                defmt::write!(f, "RetransmissionLimit({})", retries)
+            }
             SdoError::TxError(_) => defmt::write!(f, "TxError"),
             SdoError::BufferSizeWrong => defmt::write!(f, "BufferSizeWrong"),
             SdoError::InvalidNodeId => defmt::write!(f, "InvalidNodeId"),
@@ -908,8 +912,14 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         // --- Main Loop: Send sub-blocks ---
         let mut offset = 0usize;
         let mut chunk_buf = [0u8; 7];
+        let mut block_count = 0u32;
+        let mut total_retransmissions = 0u32;
+
+        #[cfg(feature = "defmt")]
+        let total_blocks = (size as usize).div_ceil(blksize as usize * 7);
 
         while offset < size as usize {
+            block_count += 1;
             // --- Send one sub-block ---
             let sub_block_start_offset = offset;
             let mut last_sent_seqno_in_block = 0;
@@ -945,6 +955,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
             }
 
             // --- Await sub-block acknowledgement ---
+            let mut retransmission_count = 0u32;
             'ack_loop: loop {
                 *self.state.pending.borrow_mut() = Some(Pending::BlockDownloadAck);
                 self.state.sig_block_ack.reset();
@@ -964,6 +975,15 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                 }
 
                 if ackseq == last_sent_seqno_in_block {
+                    // Block acknowledged successfully
+                    #[cfg(feature = "defmt")]
+                    defmt::debug!(
+                        "Block {}/{} complete ({} bytes, {} retransmissions this block)",
+                        block_count,
+                        total_blocks,
+                        offset,
+                        retransmission_count
+                    );
                     if next_blksize > 0 && next_blksize <= 127 {
                         blksize = next_blksize;
                     } else if next_blksize != 0 {
@@ -972,6 +992,30 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                     break 'ack_loop;
                 } else {
                     // Retransmission needed
+                    retransmission_count += 1;
+                    total_retransmissions += 1;
+
+                    // Prevent infinite retransmission loops
+                    const MAX_RETRANSMISSIONS_PER_BLOCK: u32 = 10;
+                    if retransmission_count > MAX_RETRANSMISSIONS_PER_BLOCK {
+                        #[cfg(feature = "defmt")]
+                        defmt::error!(
+                            "Too many retransmissions for block {} (>{} attempts), aborting",
+                            block_count,
+                            MAX_RETRANSMISSIONS_PER_BLOCK
+                        );
+                        return Err(SdoError::RetransmissionLimit(retransmission_count));
+                    }
+
+                    #[cfg(feature = "defmt")]
+                    defmt::warn!(
+                        "Block {} retransmission #{}: ackseq={}, expected={}, retransmitting {} segments",
+                        block_count,
+                        retransmission_count,
+                        ackseq,
+                        last_sent_seqno_in_block,
+                        last_sent_seqno_in_block - ackseq
+                    );
                     let retransmit_start_offset = sub_block_start_offset + (ackseq as usize * 7);
 
                     // Seek to the point where retransmission should start
@@ -1007,6 +1051,15 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                 }
             }
         }
+
+        // Log transfer summary
+        #[cfg(feature = "defmt")]
+        defmt::info!(
+            "Block transfer complete: {} blocks, {} bytes, {} total retransmissions",
+            block_count,
+            offset,
+            total_retransmissions
+        );
 
         // --- End of Transfer ---
         let crc_val = if use_crc {
