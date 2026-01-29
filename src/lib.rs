@@ -966,6 +966,8 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                 if let Some(t) = wait {
                     Timer::after(t).await;
                 }
+
+                //TODO: check if retransmission has been requested
             }
 
             // If nothing was sent in this sub-block, break the main loop.
@@ -1070,6 +1072,8 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                         if let Some(t) = wait {
                             Timer::after(t).await;
                         }
+
+                        //TODO: check if retransmission has been requested
                     }
                 }
             }
