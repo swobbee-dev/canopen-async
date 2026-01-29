@@ -6,7 +6,7 @@ use crc::{Algorithm, Crc};
 use embassy_sync::{
     blocking_mutex::raw::NoopRawMutex, channel::Channel, mutex::Mutex, signal::Signal,
 };
-use embassy_time::Duration;
+use embassy_time::{Duration, Timer};
 use embedded_can::{Frame, Id, StandardId, asynch::CanTx};
 
 const ABORT_INVALID_BLOCK_SIZE: u32 = 0x05040002;
@@ -353,7 +353,21 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         request_crc_support: bool,
     ) -> Result<(), SdoError<TX::Error>> {
         let _guard = self.request_lock.lock().await;
-        self.write_block_locked(index, sub, stream, size, request_crc_support)
+        self.write_block_locked(index, sub, stream, size, request_crc_support, None)
+            .await
+    }
+
+    pub async fn write_block_with_wait<S: StreamReader<TX::Error> + StreamSeeker<TX::Error>>(
+        &self,
+        index: u16,
+        sub: u8,
+        stream: &mut S,
+        size: u32,
+        request_crc_support: bool,
+        wait: Duration,
+    ) -> Result<(), SdoError<TX::Error>> {
+        let _guard = self.request_lock.lock().await;
+        self.write_block_locked(index, sub, stream, size, request_crc_support, Some(wait))
             .await
     }
 
@@ -873,6 +887,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         stream: &mut S,
         size: u32,
         request_crc_support: bool,
+        wait: Option<Duration>,
     ) -> Result<(), SdoError<TX::Error>> {
         const XMODEM: Crc<u16> = Crc::<u16>::new(&Algorithm {
             width: 16,
@@ -946,6 +961,10 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
 
                 if last_segment_of_transfer {
                     break;
+                }
+
+                if let Some(t) = wait {
+                    Timer::after(t).await;
                 }
             }
 
@@ -1046,6 +1065,10 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
 
                         if is_last {
                             break;
+                        }
+
+                        if let Some(t) = wait {
+                            Timer::after(t).await;
                         }
                     }
                 }
