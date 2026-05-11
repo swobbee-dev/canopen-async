@@ -96,7 +96,7 @@ pub struct SdoClient<FRAME, TX: CanTx<Frame = FRAME>> {
 }
 
 // A queue size of 4 should be sufficient for most CAN bus conditions.
-const BLOCK_SEGMENT_QUEUE_SIZE: usize = 4;
+const BLOCK_SEGMENT_QUEUE_SIZE: usize = 127;
 
 struct RequestState<FRAME, TX: CanTx<Frame = FRAME>> {
     pending: RefCell<Option<Pending>>,
