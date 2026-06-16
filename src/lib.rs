@@ -6,7 +6,7 @@ use crc::{Algorithm, Crc};
 use embassy_sync::{
     blocking_mutex::raw::NoopRawMutex, channel::Channel, mutex::Mutex, signal::Signal,
 };
-use embassy_time::Duration;
+use embassy_time::{Duration, Timer};
 use embedded_can::{Frame, Id, StandardId, asynch::CanTx};
 
 const ABORT_INVALID_BLOCK_SIZE: u32 = 0x05040002;
@@ -29,6 +29,7 @@ pub enum SdoError<E> {
     TxError(E),
     InvalidResponse,
     SdoAbort(u32),
+    RetransmissionLimit(u32),
     BufferSizeWrong,
     InvalidNodeId,
     StreamError,
@@ -42,6 +43,9 @@ impl<E> defmt::Format for SdoError<E> {
             SdoError::RequestPending => defmt::write!(f, "RequestPending"),
             SdoError::InvalidResponse => defmt::write!(f, "InvalidResponse"),
             SdoError::SdoAbort(code) => defmt::write!(f, "SdoAbort(0x{:08X})", code),
+            SdoError::RetransmissionLimit(retries) => {
+                defmt::write!(f, "RetransmissionLimit({})", retries)
+            }
             SdoError::TxError(_) => defmt::write!(f, "TxError"),
             SdoError::BufferSizeWrong => defmt::write!(f, "BufferSizeWrong"),
             SdoError::InvalidNodeId => defmt::write!(f, "InvalidNodeId"),
@@ -92,7 +96,7 @@ pub struct SdoClient<FRAME, TX: CanTx<Frame = FRAME>> {
 }
 
 // A queue size of 4 should be sufficient for most CAN bus conditions.
-const BLOCK_SEGMENT_QUEUE_SIZE: usize = 4;
+const BLOCK_SEGMENT_QUEUE_SIZE: usize = 127;
 
 struct RequestState<FRAME, TX: CanTx<Frame = FRAME>> {
     pending: RefCell<Option<Pending>>,
@@ -349,7 +353,21 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         request_crc_support: bool,
     ) -> Result<(), SdoError<TX::Error>> {
         let _guard = self.request_lock.lock().await;
-        self.write_block_locked(index, sub, stream, size, request_crc_support)
+        self.write_block_locked(index, sub, stream, size, request_crc_support, None)
+            .await
+    }
+
+    pub async fn write_block_with_wait<S: StreamReader<TX::Error> + StreamSeeker<TX::Error>>(
+        &self,
+        index: u16,
+        sub: u8,
+        stream: &mut S,
+        size: u32,
+        request_crc_support: bool,
+        wait: Duration,
+    ) -> Result<(), SdoError<TX::Error>> {
+        let _guard = self.request_lock.lock().await;
+        self.write_block_locked(index, sub, stream, size, request_crc_support, Some(wait))
             .await
     }
 
@@ -869,6 +887,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         stream: &mut S,
         size: u32,
         request_crc_support: bool,
+        wait: Option<Duration>,
     ) -> Result<(), SdoError<TX::Error>> {
         const XMODEM: Crc<u16> = Crc::<u16>::new(&Algorithm {
             width: 16,
@@ -908,8 +927,14 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         // --- Main Loop: Send sub-blocks ---
         let mut offset = 0usize;
         let mut chunk_buf = [0u8; 7];
+        let mut block_count = 0u32;
+        let mut total_retransmissions = 0u32;
+
+        #[cfg(feature = "defmt")]
+        let total_blocks = (size as usize).div_ceil(blksize as usize * 7);
 
         while offset < size as usize {
+            block_count += 1;
             // --- Send one sub-block ---
             let sub_block_start_offset = offset;
             let mut last_sent_seqno_in_block = 0;
@@ -937,6 +962,12 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                 if last_segment_of_transfer {
                     break;
                 }
+
+                if let Some(t) = wait {
+                    Timer::after(t).await;
+                }
+
+                //TODO: check if retransmission has been requested
             }
 
             // If nothing was sent in this sub-block, break the main loop.
@@ -945,6 +976,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
             }
 
             // --- Await sub-block acknowledgement ---
+            let mut retransmission_count = 0u32;
             'ack_loop: loop {
                 *self.state.pending.borrow_mut() = Some(Pending::BlockDownloadAck);
                 self.state.sig_block_ack.reset();
@@ -964,6 +996,15 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                 }
 
                 if ackseq == last_sent_seqno_in_block {
+                    // Block acknowledged successfully
+                    #[cfg(feature = "defmt")]
+                    defmt::debug!(
+                        "Block {}/{} complete ({} bytes, {} retransmissions this block)",
+                        block_count,
+                        total_blocks,
+                        offset,
+                        retransmission_count
+                    );
                     if next_blksize > 0 && next_blksize <= 127 {
                         blksize = next_blksize;
                     } else if next_blksize != 0 {
@@ -972,6 +1013,30 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                     break 'ack_loop;
                 } else {
                     // Retransmission needed
+                    retransmission_count += 1;
+                    total_retransmissions += 1;
+
+                    // Prevent infinite retransmission loops
+                    const MAX_RETRANSMISSIONS_PER_BLOCK: u32 = 10;
+                    if retransmission_count > MAX_RETRANSMISSIONS_PER_BLOCK {
+                        #[cfg(feature = "defmt")]
+                        defmt::error!(
+                            "Too many retransmissions for block {} (>{} attempts), aborting",
+                            block_count,
+                            MAX_RETRANSMISSIONS_PER_BLOCK
+                        );
+                        return Err(SdoError::RetransmissionLimit(retransmission_count));
+                    }
+
+                    #[cfg(feature = "defmt")]
+                    defmt::warn!(
+                        "Block {} retransmission #{}: ackseq={}, expected={}, retransmitting {} segments",
+                        block_count,
+                        retransmission_count,
+                        ackseq,
+                        last_sent_seqno_in_block,
+                        last_sent_seqno_in_block - ackseq
+                    );
                     let retransmit_start_offset = sub_block_start_offset + (ackseq as usize * 7);
 
                     // Seek to the point where retransmission should start
@@ -1003,10 +1068,25 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                         if is_last {
                             break;
                         }
+
+                        if let Some(t) = wait {
+                            Timer::after(t).await;
+                        }
+
+                        //TODO: check if retransmission has been requested
                     }
                 }
             }
         }
+
+        // Log transfer summary
+        #[cfg(feature = "defmt")]
+        defmt::info!(
+            "Block transfer complete: {} blocks, {} bytes, {} total retransmissions",
+            block_count,
+            offset,
+            total_retransmissions
+        );
 
         // --- End of Transfer ---
         let crc_val = if use_crc {
