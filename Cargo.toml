@@ -23,3 +23,4 @@ embassy-time = { version = "0.5.1", features = ["std"] }
 embassy-time-queue-utils = { version = "0.3", features = ["generic-queue-8"] }
 critical-section = { version = "1.2", features = ["std"] }
 futures = { version = "0.3", features = ["executor"] }
+crc = "3"

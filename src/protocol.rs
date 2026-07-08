@@ -97,7 +97,11 @@ pub(crate) enum ParseOutcome {
     BlockAck(BlockAck),
     BlockUploadInit(BlockUploadInit),
     BlockUploadSegment(BlockUploadSegment),
-    BlockUploadEnd { crc: u16 },
+    BlockUploadEnd {
+        crc: u16,
+        /// Number of bytes in the last segment that do NOT contain data.
+        unused_bytes: u8,
+    },
 }
 
 /// Protocol-level failure while interpreting a response payload.
@@ -288,10 +292,12 @@ pub(crate) fn parse_response(pending: Pending, data: &[u8]) -> Result<ParseOutco
         }
 
         Pending::BlockUploadEndWait => {
-            // Must be the end of upload frame from server: cs = 110nnn01b
+            // Must be the end of upload frame from server: cs = 110nnn01b,
+            // where nnn is the count of unused bytes in the last segment.
             if (command & 0b11100011) == 0b11000001 {
                 let crc = u16::from_le_bytes(data[1..3].try_into().unwrap());
-                Ok(ParseOutcome::BlockUploadEnd { crc })
+                let unused_bytes = (command >> 2) & 0x07;
+                Ok(ParseOutcome::BlockUploadEnd { crc, unused_bytes })
             } else {
                 Err(ParseError::InvalidResponse)
             }
@@ -665,10 +671,24 @@ mod tests {
             Some(ParseError::InvalidResponse)
         );
 
-        // End frame carries the CRC: cs = 110nnn01
+        // End frame carries the CRC and the unused-byte count: cs = 110nnn01.
+        // n = 4 unused bytes -> cs = 110_100_01 = 0xD1
+        let data = [0xD1, 0x34, 0x12, 0, 0, 0, 0, 0];
+        match parse_response(Pending::BlockUploadEndWait, &data).unwrap() {
+            ParseOutcome::BlockUploadEnd { crc, unused_bytes } => {
+                assert_eq!(crc, 0x1234);
+                assert_eq!(unused_bytes, 4);
+            }
+            _ => panic!("expected BlockUploadEnd"),
+        }
+
+        // n = 0: full last segment
         let data = [0xC1, 0x34, 0x12, 0, 0, 0, 0, 0];
         match parse_response(Pending::BlockUploadEndWait, &data).unwrap() {
-            ParseOutcome::BlockUploadEnd { crc } => assert_eq!(crc, 0x1234),
+            ParseOutcome::BlockUploadEnd { crc, unused_bytes } => {
+                assert_eq!(crc, 0x1234);
+                assert_eq!(unused_bytes, 0);
+            }
             _ => panic!("expected BlockUploadEnd"),
         }
     }

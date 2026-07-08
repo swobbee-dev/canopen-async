@@ -119,7 +119,8 @@ struct RequestState<FRAME, TX: CanTx<Frame = FRAME>> {
         Result<BlockUploadSegment, SdoError<TX::Error>>,
         BLOCK_SEGMENT_QUEUE_SIZE,
     >,
-    sig_block_upload_end: Signal<NoopRawMutex, Result<u16, SdoError<TX::Error>>>,
+    /// End-of-block-upload: (crc, unused bytes in last segment)
+    sig_block_upload_end: Signal<NoopRawMutex, Result<(u16, u8), SdoError<TX::Error>>>,
 }
 
 enum SdoRequest<'a> {
@@ -376,8 +377,8 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                         *self.state.pending.borrow_mut() = None;
                     }
                 }
-                ParseOutcome::BlockUploadEnd { crc } => {
-                    self.state.sig_block_upload_end.signal(Ok(crc))
+                ParseOutcome::BlockUploadEnd { crc, unused_bytes } => {
+                    self.state.sig_block_upload_end.signal(Ok((crc, unused_bytes)))
                 }
             },
         }
@@ -575,6 +576,10 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         let mut offset = 0usize;
         let mut transfer_complete = matches!(size, Some(0));
 
+        // The final segment (c bit set) is held back: how many of its bytes
+        // are valid is only known from the end-of-transfer frame's n field.
+        let mut final_segment: Option<[u8; 7]> = None;
+
         // Clear any stale segments from a previous failed run
         while self.state.block_upload_seg_chan.try_receive().is_ok() {}
 
@@ -598,33 +603,25 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                     return Err(SdoError::SdoAbort(ABORT_SEQ_NUM_ERROR));
                 }
 
-                let mut data_len = segment.len;
-                if let Some(s) = size {
-                    let remaining_bytes = (s as usize).saturating_sub(offset);
-                    data_len = data_len.min(remaining_bytes);
-                }
-                let remaining_buf_space = buf.len().saturating_sub(offset);
-                data_len = data_len.min(remaining_buf_space);
-
-                buf[offset..offset + data_len].copy_from_slice(&segment.data[..data_len]);
-
-                if use_crc {
-                    crc_digest.update(&buf[offset..offset + data_len]);
-                }
-
-                offset += data_len;
                 last_received_seqno = segment.seqno;
 
                 if segment.last {
+                    final_segment = Some(segment.data);
                     transfer_complete = true;
                     break;
                 }
-                if let Some(s) = size {
-                    if offset as u32 >= s {
-                        transfer_complete = true;
-                        break;
-                    }
+
+                // Intermediate segments always carry 7 data bytes.
+                if offset + segment.len > buf.len() {
+                    return Err(SdoError::BufferSizeWrong);
                 }
+                buf[offset..offset + segment.len].copy_from_slice(&segment.data[..segment.len]);
+
+                if use_crc {
+                    crc_digest.update(&buf[offset..offset + segment.len]);
+                }
+
+                offset += segment.len;
             }
 
             // --- 4. Acknowledge sub-block ---
@@ -637,7 +634,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         *self.state.pending.borrow_mut() = Some(Pending::BlockUploadEndWait);
         self.state.sig_block_upload_end.reset();
 
-        let server_crc =
+        let (server_crc, unused_bytes) =
             match embassy_time::with_timeout(self.timeout, self.state.sig_block_upload_end.wait())
                 .await
             {
@@ -645,7 +642,28 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                 Err(_) => return Err(SdoError::Timeout),
             };
 
-        // --- 6. Validate CRC and send final confirmation ---
+        // --- 6. Commit the held-back final segment now that its valid
+        // length is known from the end frame ---
+        if let Some(data) = final_segment {
+            let valid = 7usize.saturating_sub(unused_bytes as usize);
+            if offset + valid > buf.len() {
+                return Err(SdoError::BufferSizeWrong);
+            }
+            buf[offset..offset + valid].copy_from_slice(&data[..valid]);
+            if use_crc {
+                crc_digest.update(&buf[offset..offset + valid]);
+            }
+            offset += valid;
+        }
+
+        // If the server announced a size, the received byte count must match.
+        if let Some(s) = size {
+            if offset != s as usize {
+                return Err(SdoError::InvalidResponse);
+            }
+        }
+
+        // --- 7. Validate CRC and send final confirmation ---
         if use_crc {
             let client_crc = crc_digest.finalize();
             if client_crc != server_crc {

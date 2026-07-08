@@ -115,22 +115,24 @@ impl Harness {
     }
 }
 
-/// Drive a client future while feeding it the given responses in order,
-/// one after each frame the client transmits.
-fn run_with_responses<F>(harness: &Harness, fut: F, responses: Vec<TestFrame>) -> F::Output
+/// Drive a client future while feeding it one batch of response frames per
+/// client transmission (a block-upload server sends whole sub-blocks without
+/// intervening client frames).
+fn run_with_batches<F>(harness: &Harness, fut: F, batches: Vec<Vec<TestFrame>>) -> F::Output
 where
     F: core::future::Future,
 {
     let feeder = async {
-        let mut responses = responses.into_iter().peekable();
+        let mut batches = batches.into_iter().peekable();
         let mut seen_tx = 0;
-        // Feed one response per client transmission; done when all are fed.
-        while responses.peek().is_some() {
+        // Feed one batch per client transmission; done when all are fed.
+        while batches.peek().is_some() {
             let tx_count = harness.sent.borrow().len();
             if tx_count > seen_tx {
                 seen_tx = tx_count;
-                let resp = responses.next().unwrap();
-                harness.client.on_frame_received(resp).await;
+                for resp in batches.next().unwrap() {
+                    harness.client.on_frame_received(resp).await;
+                }
             } else {
                 // Yield so the client future can make progress.
                 futures_ext::yield_once().await;
@@ -138,6 +140,15 @@ where
         }
     };
     block_on(async { join!(fut, feeder) }).0
+}
+
+/// Drive a client future feeding exactly one response per client transmission.
+fn run_with_responses<F>(harness: &Harness, fut: F, responses: Vec<TestFrame>) -> F::Output
+where
+    F: core::future::Future,
+{
+    let batches = responses.into_iter().map(|r| vec![r]).collect();
+    run_with_batches(harness, fut, batches)
 }
 
 // A tiny yield helper; futures 0.3 has no pending_once, so emulate it.
@@ -250,4 +261,62 @@ fn timeout_when_no_response() {
     let h = Harness::new();
     let result = block_on(h.client.read_expedited(IDX, SUB));
     assert_eq!(result.unwrap_err(), SdoError::Timeout);
+}
+
+/// XMODEM CRC over `data`, as used by SDO block transfers.
+fn block_crc(data: &[u8]) -> u16 {
+    crc::Crc::<u16>::new(&crc::CRC_16_XMODEM).checksum(data)
+}
+
+/// Batches for a complete 10-byte block upload: init response (given cs +
+/// tail), two segments (7 + 3 bytes), end frame announcing 4 unused bytes.
+fn block_upload_batches(init_cs: u8, init_tail: [u8; 4]) -> Vec<Vec<TestFrame>> {
+    let crc = block_crc(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]).to_le_bytes();
+    vec![
+        // response to initiate request
+        vec![Harness::response(init_cs, init_tail)],
+        // response to start-upload: both segments, second with c bit set.
+        // The last segment's tail bytes are garbage the client must discard.
+        vec![
+            Harness::raw_response(&[0x01, 1, 2, 3, 4, 5, 6, 7]),
+            Harness::raw_response(&[0x82, 8, 9, 10, 0xEE, 0xEE, 0xEE, 0xEE]),
+        ],
+        // response to sub-block ack: end frame, n=4 -> cs = 110_100_01
+        vec![Harness::raw_response(&[0xD1, crc[0], crc[1], 0, 0, 0, 0, 0])],
+    ]
+}
+
+#[test]
+fn read_block_with_size_returns_length() {
+    let h = Harness::new();
+    let mut buf = [0u8; 32];
+    let result = run_with_batches(
+        &h,
+        h.client.read_block(IDX, SUB, &mut buf, true),
+        block_upload_batches(0xC6, 10u32.to_le_bytes()),
+    );
+    assert_eq!(result.unwrap(), 10);
+    assert_eq!(buf[..10], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+
+    // Client must confirm the end of the transfer (cs 0xA1)
+    let sent = h.sent_payloads();
+    assert_eq!(sent.last().unwrap()[0], 0xA1);
+}
+
+#[test]
+fn read_block_without_size_uses_end_frame_n_bits() {
+    // Regression: with no size announced (cs 0xC4, s bit clear), the padding
+    // bytes of the last segment used to be copied out and fed to the CRC,
+    // producing garbage data and a spurious CRC mismatch.
+    let h = Harness::new();
+    let mut buf = [0u8; 32];
+    let result = run_with_batches(
+        &h,
+        h.client.read_block(IDX, SUB, &mut buf, true),
+        block_upload_batches(0xC4, [0; 4]),
+    );
+    assert_eq!(result.unwrap(), 10);
+    assert_eq!(buf[..10], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    // The padding bytes must not leak into the buffer
+    assert!(!buf[10..].contains(&0xEE));
 }
