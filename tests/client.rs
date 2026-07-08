@@ -205,6 +205,9 @@ fn read_expedited_on_segmented_reply_is_not_expedited() {
         vec![Harness::response(0x41, 260u32.to_le_bytes())],
     );
     assert_eq!(result.unwrap_err(), SdoError::NotExpedited);
+    // The server has started a segmented transfer the client won't finish;
+    // it must be aborted (0x0800_0000, general error).
+    assert_eq!(h.sent_payloads().last().unwrap(), &abort_payload(0x0800_0000));
 }
 
 #[test]
@@ -256,11 +259,52 @@ fn read_expedited_accepts_no_size_response() {
     assert_eq!(result.unwrap(), 0xAABB_CCDD);
 }
 
+/// The abort payload the client must send for `code` on the test object.
+fn abort_payload(code: u32) -> Vec<u8> {
+    let idx = IDX.to_le_bytes();
+    let code = code.to_le_bytes();
+    vec![0x80, idx[0], idx[1], SUB, code[0], code[1], code[2], code[3]]
+}
+
 #[test]
 fn timeout_when_no_response() {
     let h = Harness::new();
     let result = block_on(h.client.read_expedited(IDX, SUB));
     assert_eq!(result.unwrap_err(), SdoError::Timeout);
+
+    // Regression: the client must abort the transfer (0x0504_0000, timeout)
+    // so the server releases its state instead of being left mid-transfer.
+    let sent = h.sent_payloads();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1], abort_payload(0x0504_0000));
+}
+
+#[test]
+fn invalid_response_sends_abort() {
+    let h = Harness::new();
+    // cs 0x45 is in the initiate-upload response family but not a valid
+    // combination -> InvalidResponse plus an abort (0x0504_0001).
+    let result = run_with_responses(
+        &h,
+        h.client.read_expedited(IDX, SUB),
+        vec![Harness::response(0x45, [0; 4])],
+    );
+    assert_eq!(result.unwrap_err(), SdoError::InvalidResponse);
+    assert_eq!(h.sent_payloads().last().unwrap(), &abort_payload(0x0504_0001));
+}
+
+#[test]
+fn crc_mismatch_sends_abort() {
+    let h = Harness::new();
+    let mut buf = [0u8; 32];
+    let mut batches = block_upload_batches(0xC6, 10u32.to_le_bytes());
+    // Corrupt the server CRC in the end frame
+    batches.last_mut().unwrap()[0] = Harness::raw_response(&[0xD1, 0xBA, 0xAD, 0, 0, 0, 0, 0]);
+
+    let result = run_with_batches(&h, h.client.read_block(IDX, SUB, &mut buf, true), batches);
+    assert_eq!(result.unwrap_err(), SdoError::SdoAbort(0x0504_0004));
+    // The client must abort instead of confirming the transfer
+    assert_eq!(h.sent_payloads().last().unwrap(), &abort_payload(0x0504_0004));
 }
 
 /// XMODEM CRC over `data`, as used by SDO block transfers.

@@ -13,7 +13,8 @@ use embassy_sync::{
 use embassy_time::Duration;
 use embedded_can::{Frame, Id, StandardId, asynch::CanTx};
 use protocol::{
-    ABORT_CRC_ERROR, ABORT_INVALID_BLOCK_SIZE, ABORT_SEQ_NUM_ERROR, ParseOutcome, Pending,
+    ABORT_CRC_ERROR, ABORT_GENERAL_ERROR, ABORT_INVALID_BLOCK_SIZE, ABORT_INVALID_CS,
+    ABORT_OUT_OF_MEMORY, ABORT_SEQ_NUM_ERROR, ABORT_TIMEOUT, ParseOutcome, Pending, encode_abort,
     encode_block_download_segment, encode_block_upload_ack, encode_download_expedited,
     encode_download_segment, encode_end_block_download, encode_end_block_upload_confirmation,
     encode_initiate_block_download, encode_initiate_block_upload,
@@ -255,7 +256,8 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
 
     pub async fn read_expedited(&self, index: u16, sub: u8) -> Result<u32, SdoError<TX::Error>> {
         let _guard = self.request_lock.lock().await;
-        self.read_expedited_locked(index, sub).await
+        let result = self.read_expedited_locked(index, sub).await;
+        self.abort_on_local_failure(index, sub, result).await
     }
 
     pub async fn write_expedited(
@@ -265,7 +267,8 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         data: &[u8],
     ) -> Result<(), SdoError<TX::Error>> {
         let _guard = self.request_lock.lock().await;
-        self.write_expedited_locked(index, sub, data).await
+        let result = self.write_expedited_locked(index, sub, data).await;
+        self.abort_on_local_failure(index, sub, result).await
     }
 
     /// Read an object of arbitrary size into `buf`.
@@ -280,7 +283,8 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         buf: &mut [u8],
     ) -> Result<usize, SdoError<TX::Error>> {
         let _guard = self.request_lock.lock().await;
-        self.read_segmented_locked(index, sub, buf).await
+        let result = self.read_segmented_locked(index, sub, buf).await;
+        self.abort_on_local_failure(index, sub, result).await
     }
 
     #[allow(dead_code)]
@@ -291,7 +295,8 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         data: &[u8],
     ) -> Result<(), SdoError<TX::Error>> {
         let _guard = self.request_lock.lock().await;
-        self.write_segmented_locked(index, sub, data).await
+        let result = self.write_segmented_locked(index, sub, data).await;
+        self.abort_on_local_failure(index, sub, result).await
     }
 
     /// Read an object via block transfer into `buf`.
@@ -305,8 +310,10 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         request_crc_support: bool,
     ) -> Result<usize, SdoError<TX::Error>> {
         let _guard = self.request_lock.lock().await;
-        self.read_block_locked(index, sub, buf, request_crc_support)
-            .await
+        let result = self
+            .read_block_locked(index, sub, buf, request_crc_support)
+            .await;
+        self.abort_on_local_failure(index, sub, result).await
     }
 
     pub async fn write_block<S: StreamReader<TX::Error> + StreamSeeker<TX::Error>>(
@@ -318,8 +325,10 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         request_crc_support: bool,
     ) -> Result<(), SdoError<TX::Error>> {
         let _guard = self.request_lock.lock().await;
-        self.write_block_locked(index, sub, stream, size, request_crc_support)
-            .await
+        let result = self
+            .write_block_locked(index, sub, stream, size, request_crc_support)
+            .await;
+        self.abort_on_local_failure(index, sub, result).await
     }
 
     pub async fn on_frame_received(&self, frame: FRAME) {
@@ -600,7 +609,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                 };
 
                 if segment.seqno != expected_seqno {
-                    return Err(SdoError::SdoAbort(ABORT_SEQ_NUM_ERROR));
+                    return Err(self.abort_transfer(index, sub, ABORT_SEQ_NUM_ERROR).await);
                 }
 
                 last_received_seqno = segment.seqno;
@@ -667,7 +676,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         if use_crc {
             let client_crc = crc_digest.finalize();
             if client_crc != server_crc {
-                return Err(SdoError::SdoAbort(ABORT_CRC_ERROR));
+                return Err(self.abort_transfer(index, sub, ABORT_CRC_ERROR).await);
             }
         }
 
@@ -718,7 +727,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         let use_crc = request_crc_support && server_supports_crc;
 
         if blksize == 0 || blksize > 127 {
-            return Err(SdoError::SdoAbort(ABORT_INVALID_BLOCK_SIZE));
+            return Err(self.abort_transfer(index, sub, ABORT_INVALID_BLOCK_SIZE).await);
         }
 
         // --- Main Loop: Send sub-blocks ---
@@ -783,7 +792,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                     if next_blksize > 0 && next_blksize <= 127 {
                         blksize = next_blksize;
                     } else if next_blksize != 0 {
-                        return Err(SdoError::SdoAbort(ABORT_INVALID_BLOCK_SIZE));
+                        return Err(self.abort_transfer(index, sub, ABORT_INVALID_BLOCK_SIZE).await);
                     }
                     break 'ack_loop;
                 } else {
@@ -882,6 +891,42 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         let id = 0x600 + (self.node_id as u16);
         let frame = FRAME::new(Id::Standard(StandardId::new(id).unwrap()), payload).unwrap();
         self.can_tx.lock().await.transmit(&frame).await
+    }
+
+    /// Send an abort for the transfer on `index`/`sub` and return the
+    /// matching error. Used where the client itself detects a protocol
+    /// violation mid-transfer.
+    async fn abort_transfer(&self, index: u16, sub: u8, code: u32) -> SdoError<TX::Error> {
+        // Best effort: the abort must not mask the original error.
+        let _ = self.send_payload(&encode_abort(index, sub, code)).await;
+        SdoError::SdoAbort(code)
+    }
+
+    /// Transmit an abort for local failures so the server releases its
+    /// transfer state (CiA 301 requires the giving-up peer to abort).
+    ///
+    /// Server-sent aborts (`SdoAbort` from a response) and TX failures are
+    /// passed through: the former needs no reply, the latter cannot be sent.
+    /// Locally raised `SdoAbort`s go through [`Self::abort_transfer`] instead.
+    async fn abort_on_local_failure<T>(
+        &self,
+        index: u16,
+        sub: u8,
+        result: Result<T, SdoError<TX::Error>>,
+    ) -> Result<T, SdoError<TX::Error>> {
+        if let Err(err) = &result {
+            let code = match err {
+                SdoError::Timeout => ABORT_TIMEOUT,
+                SdoError::InvalidResponse => ABORT_INVALID_CS,
+                SdoError::BufferSizeWrong => ABORT_OUT_OF_MEMORY,
+                // The server started a transfer we are not going to finish
+                SdoError::NotExpedited => ABORT_GENERAL_ERROR,
+                SdoError::StreamError => ABORT_GENERAL_ERROR,
+                _ => return result,
+            };
+            let _ = self.send_payload(&encode_abort(index, sub, code)).await;
+        }
+        result
     }
 
     async fn send_sdo_upload_request(&self, index: u16, subindex: u8) -> Result<(), TX::Error> {

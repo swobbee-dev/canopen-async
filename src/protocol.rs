@@ -8,9 +8,13 @@
 
 use crate::SdoError;
 
+pub(crate) const ABORT_TIMEOUT: u32 = 0x05040000;
+pub(crate) const ABORT_INVALID_CS: u32 = 0x05040001;
 pub(crate) const ABORT_INVALID_BLOCK_SIZE: u32 = 0x05040002;
 pub(crate) const ABORT_SEQ_NUM_ERROR: u32 = 0x05040003;
 pub(crate) const ABORT_CRC_ERROR: u32 = 0x05040004;
+pub(crate) const ABORT_OUT_OF_MEMORY: u32 = 0x05040005;
+pub(crate) const ABORT_GENERAL_ERROR: u32 = 0x0800_0000;
 
 /// The request the client is currently waiting on; determines how a response
 /// payload is interpreted and which waiter an outcome or error is routed to.
@@ -317,6 +321,17 @@ fn check_multiplexer(data: &[u8], index: u16, sub: u8) -> Result<(), ParseError>
 }
 
 // ## --- REQUEST ENCODING --- ##
+
+/// Abort an ongoing transfer (cs 0x80). Sent by the client when it gives up
+/// on a transfer so the server releases its state (CiA 301, 7.2.4.3.17).
+pub(crate) fn encode_abort(index: u16, sub: u8, code: u32) -> [u8; 8] {
+    let mut payload = [0u8; 8];
+    payload[0] = 0x80;
+    payload[1..3].copy_from_slice(&index.to_le_bytes());
+    payload[3] = sub;
+    payload[4..8].copy_from_slice(&code.to_le_bytes());
+    payload
+}
 
 pub(crate) fn encode_upload_request(index: u16, sub: u8) -> [u8; 8] {
     let mut payload = [0u8; 8];
