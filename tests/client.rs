@@ -131,7 +131,7 @@ where
             if tx_count > seen_tx {
                 seen_tx = tx_count;
                 for resp in batches.next().unwrap() {
-                    harness.client.on_frame_received(resp).await;
+                    harness.client.process_frame(&resp);
                 }
             } else {
                 // Yield so the client future can make progress.
