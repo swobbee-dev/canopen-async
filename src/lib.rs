@@ -121,8 +121,11 @@ struct RequestState<FRAME, TX: CanTx<Frame = FRAME>> {
         BLOCK_SEGMENT_QUEUE_SIZE,
     >,
     /// End-of-block-upload: (crc, unused bytes in last segment)
-    sig_block_upload_end: Signal<NoopRawMutex, Result<(u16, u8), SdoError<TX::Error>>>,
+    sig_block_upload_end: Signal<NoopRawMutex, BlockUploadEndResult<TX::Error>>,
 }
+
+/// End-of-block-upload outcome: (crc, unused bytes in last segment).
+type BlockUploadEndResult<E> = Result<(u16, u8), SdoError<E>>;
 
 enum SdoRequest<'a> {
     UploadExpedited {
@@ -468,10 +471,10 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
             }
 
             UploadInit::Segmented { size } => {
-                if let Some(size) = size {
-                    if size as usize > buf.len() {
-                        return Err(SdoError::BufferSizeWrong);
-                    }
+                if let Some(size) = size
+                    && size as usize > buf.len()
+                {
+                    return Err(SdoError::BufferSizeWrong);
                 }
 
                 // Initiation successful, start requesting segments
@@ -602,10 +605,10 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
             Err(_) => return Err(SdoError::Timeout),
         };
 
-        if let Some(s) = size {
-            if s as usize > buf.len() {
-                return Err(SdoError::BufferSizeWrong);
-            }
+        if let Some(s) = size
+            && s as usize > buf.len()
+        {
+            return Err(SdoError::BufferSizeWrong);
         }
         let use_crc = request_crc_support && server_supports_crc;
 
@@ -699,10 +702,10 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         }
 
         // If the server announced a size, the received byte count must match.
-        if let Some(s) = size {
-            if offset != s as usize {
-                return Err(SdoError::InvalidResponse);
-            }
+        if let Some(s) = size
+            && offset != s as usize
+        {
+            return Err(SdoError::InvalidResponse);
         }
 
         // --- 7. Validate CRC and send final confirmation ---
