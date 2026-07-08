@@ -15,3 +15,11 @@ embedded-can = { version = "0.4.1", git = "https://github.com/swobbee-dev/embedd
 [features]
 default = ["defmt"]
 defmt = ["dep:defmt"]
+
+[dev-dependencies]
+# std time driver + generic timer queue so client-level tests can exercise
+# real timeouts without an embassy executor
+embassy-time = { version = "0.5.1", features = ["std"] }
+embassy-time-queue-utils = { version = "0.3", features = ["generic-queue-8"] }
+critical-section = { version = "1.2", features = ["std"] }
+futures = { version = "0.3", features = ["executor"] }

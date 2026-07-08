@@ -66,12 +66,29 @@ pub struct BlockUploadSegment {
     pub(crate) data: [u8; 7],
 }
 
+/// Server's answer to an initiate-upload request (CiA 301, 7.2.4.3.6).
+///
+/// The server chooses the transfer type: small objects come back expedited
+/// (data in the initiate response itself), larger ones announce a segmented
+/// transfer. Both are legal answers to the same request, so callers must
+/// handle both.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub(crate) enum UploadInit {
+    /// Expedited response: `data[..len]` is the object value. Bytes beyond
+    /// `len` are zeroed. If the server did not indicate a size (cs `0x42`),
+    /// `len` is 4.
+    Expedited { data: [u8; 4], len: usize },
+    /// Segmented transfer announced; `size` is the total byte count if the
+    /// server indicated one.
+    Segmented { size: Option<u32> },
+}
+
 /// Successful interpretation of a response payload for a [`Pending`] request.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub(crate) enum ParseOutcome {
-    /// Expedited upload data, expedited download ack payload word, or the
-    /// size announced by a segmented upload initiate response.
-    Word(u32),
+    /// Response to an initiate-upload request.
+    UploadInit(UploadInit),
     /// Successful acknowledge without payload.
     Ack,
     /// One upload segment.
@@ -117,20 +134,30 @@ pub(crate) fn parse_response(pending: Pending, data: &[u8]) -> Result<ParseOutco
         Pending::ExpeditedRead { index, sub } => {
             check_multiplexer(data, index, sub)?;
 
+            // Initiate upload response: cs = 010_0_nn_e_s
             match command {
-                // Expedited Upload Response (e.g. 0x43, 0x47, 0x4B, 0x4F)
-                0x43 | 0x47 | 0x4B | 0x4F => {
-                    let n_unused = ((command & 0x0C) >> 2) as usize;
-                    let data_len = 4 - n_unused;
+                // Expedited (e=1). With size indicated (s=1) nn counts the
+                // unused bytes; without (0x42, s=0) all 4 bytes may be valid.
+                0x42 | 0x43 | 0x47 | 0x4B | 0x4F => {
+                    let size_indicated = (command & 0x01) != 0;
+                    let data_len = if size_indicated {
+                        4 - ((command & 0x0C) >> 2) as usize
+                    } else {
+                        4
+                    };
                     let mut bytes = [0u8; 4];
                     bytes[..data_len].copy_from_slice(&data[4..4 + data_len]);
-                    Ok(ParseOutcome::Word(u32::from_le_bytes(bytes)))
+                    Ok(ParseOutcome::UploadInit(UploadInit::Expedited {
+                        data: bytes,
+                        len: data_len,
+                    }))
                 }
-                // Segmented Upload Initiation Response
+                // Segmented (e=0), with (0x41) or without (0x40) total size
                 0x41 => {
                     let size = u32::from_le_bytes(data[4..8].try_into().unwrap());
-                    Ok(ParseOutcome::Word(size))
+                    Ok(ParseOutcome::UploadInit(UploadInit::Segmented { size: Some(size) }))
                 }
+                0x40 => Ok(ParseOutcome::UploadInit(UploadInit::Segmented { size: None })),
                 _ => Err(ParseError::InvalidResponse),
             }
         }
@@ -451,19 +478,58 @@ mod tests {
 
     #[test]
     fn parse_expedited_upload_all_sizes() {
-        // cs 0x4F/0x4B/0x47/0x43 = 1/2/3/4 valid bytes
-        for (cs, expected) in [
-            (0x4Fu8, 0x0000_00DDu32),
-            (0x4B, 0x0000_CCDD),
-            (0x47, 0x00BB_CCDD),
-            (0x43, 0xAABB_CCDD),
+        // cs 0x4F/0x4B/0x47/0x43 = 1/2/3/4 valid bytes; bytes beyond len zeroed
+        for (cs, expected_len, expected) in [
+            (0x4Fu8, 1usize, [0xDD, 0, 0, 0]),
+            (0x4B, 2, [0xDD, 0xCC, 0, 0]),
+            (0x47, 3, [0xDD, 0xCC, 0xBB, 0]),
+            (0x43, 4, [0xDD, 0xCC, 0xBB, 0xAA]),
         ] {
-            let data = response(cs, [0xDD, 0xCC, 0xBB, 0xAA]);
-            match parse_response(expedited_read(), &data).unwrap() {
-                ParseOutcome::Word(w) => assert_eq!(w, expected, "cs={cs:#04x}"),
-                _ => panic!("expected Word for cs={cs:#04x}"),
+            let payload = response(cs, [0xDD, 0xCC, 0xBB, 0xAA]);
+            match parse_response(expedited_read(), &payload).unwrap() {
+                ParseOutcome::UploadInit(UploadInit::Expedited { data, len }) => {
+                    assert_eq!(len, expected_len, "cs={cs:#04x}");
+                    assert_eq!(data, expected, "cs={cs:#04x}");
+                }
+                _ => panic!("expected expedited UploadInit for cs={cs:#04x}"),
             }
         }
+    }
+
+    #[test]
+    fn parse_expedited_upload_without_size_indication() {
+        // cs 0x42: expedited, size not indicated -> all 4 bytes reported
+        let payload = response(0x42, [0xDD, 0xCC, 0xBB, 0xAA]);
+        assert_eq!(
+            match parse_response(expedited_read(), &payload).unwrap() {
+                ParseOutcome::UploadInit(init) => init,
+                _ => panic!("expected UploadInit"),
+            },
+            UploadInit::Expedited { data: [0xDD, 0xCC, 0xBB, 0xAA], len: 4 }
+        );
+    }
+
+    #[test]
+    fn parse_segmented_upload_initiate() {
+        // cs 0x41: segmented with size
+        let payload = response(0x41, 300u32.to_le_bytes());
+        assert_eq!(
+            match parse_response(expedited_read(), &payload).unwrap() {
+                ParseOutcome::UploadInit(init) => init,
+                _ => panic!("expected UploadInit"),
+            },
+            UploadInit::Segmented { size: Some(300) }
+        );
+
+        // cs 0x40: segmented without size indication
+        let payload = response(0x40, [0; 4]);
+        assert_eq!(
+            match parse_response(expedited_read(), &payload).unwrap() {
+                ParseOutcome::UploadInit(init) => init,
+                _ => panic!("expected UploadInit"),
+            },
+            UploadInit::Segmented { size: None }
+        );
     }
 
     #[test]

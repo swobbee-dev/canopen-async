@@ -18,7 +18,7 @@ use protocol::{
     encode_download_segment, encode_end_block_download, encode_end_block_upload_confirmation,
     encode_initiate_block_download, encode_initiate_block_upload,
     encode_initiate_segmented_download, encode_start_block_upload, encode_upload_request,
-    encode_upload_segment_request, parse_response,
+    encode_upload_segment_request, parse_response, UploadInit,
 };
 
 // CiA 301 Version 4.2.0, page 72ff
@@ -40,6 +40,9 @@ pub enum SdoError<E> {
     BufferSizeWrong,
     InvalidNodeId,
     StreamError,
+    /// The server answered an expedited read with a segmented transfer,
+    /// i.e. the object is larger than 4 bytes. Use [`SdoClient::read_segmented`].
+    NotExpedited,
 }
 
 #[cfg(feature = "defmt")]
@@ -54,6 +57,7 @@ impl<E> defmt::Format for SdoError<E> {
             SdoError::BufferSizeWrong => defmt::write!(f, "BufferSizeWrong"),
             SdoError::InvalidNodeId => defmt::write!(f, "InvalidNodeId"),
             SdoError::StreamError => defmt::write!(f, "StreamError"),
+            SdoError::NotExpedited => defmt::write!(f, "NotExpedited"),
         }
     }
 }
@@ -104,7 +108,7 @@ const BLOCK_SEGMENT_QUEUE_SIZE: usize = 4;
 
 struct RequestState<FRAME, TX: CanTx<Frame = FRAME>> {
     pending: RefCell<Option<Pending>>,
-    sig_word: Signal<NoopRawMutex, Result<u32, SdoError<TX::Error>>>,
+    sig_upload_init: Signal<NoopRawMutex, Result<UploadInit, SdoError<TX::Error>>>,
     sig_seg: Signal<NoopRawMutex, Result<Segment, SdoError<TX::Error>>>,
     sig_ack: Signal<NoopRawMutex, Result<(), SdoError<TX::Error>>>,
     sig_block_init: Signal<NoopRawMutex, Result<BlockInit, SdoError<TX::Error>>>,
@@ -168,7 +172,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
             request_lock: Mutex::new(()),
             state: RequestState {
                 pending: RefCell::new(None),
-                sig_word: Signal::new(),
+                sig_upload_init: Signal::new(),
                 sig_seg: Signal::new(),
                 sig_ack: Signal::new(),
                 sig_block_init: Signal::new(),
@@ -263,12 +267,17 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         self.write_expedited_locked(index, sub, data).await
     }
 
+    /// Read an object of arbitrary size into `buf`.
+    ///
+    /// Handles both server reply types: an expedited response delivers up to
+    /// 4 bytes directly, a segmented response is read segment by segment.
+    /// Returns the number of bytes received.
     pub async fn read_segmented(
         &self,
         index: u16,
         sub: u8,
         buf: &mut [u8],
-    ) -> Result<(), SdoError<TX::Error>> {
+    ) -> Result<usize, SdoError<TX::Error>> {
         let _guard = self.request_lock.lock().await;
         self.read_segmented_locked(index, sub, buf).await
     }
@@ -284,13 +293,16 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         self.write_segmented_locked(index, sub, data).await
     }
 
+    /// Read an object via block transfer into `buf`.
+    ///
+    /// Returns the number of bytes received.
     pub async fn read_block(
         &self,
         index: u16,
         sub: u8,
         buf: &mut [u8],
         request_crc_support: bool,
-    ) -> Result<(), SdoError<TX::Error>> {
+    ) -> Result<usize, SdoError<TX::Error>> {
         let _guard = self.request_lock.lock().await;
         self.read_block_locked(index, sub, buf, request_crc_support)
             .await
@@ -340,7 +352,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         match parse_response(pending_request, frame.data()) {
             Err(err) => self.signal_error(pending_request, err.into_sdo_error()),
             Ok(outcome) => match outcome {
-                ParseOutcome::Word(word) => self.state.sig_word.signal(Ok(word)),
+                ParseOutcome::UploadInit(init) => self.state.sig_upload_init.signal(Ok(init)),
                 ParseOutcome::Ack => self.state.sig_ack.signal(Ok(())),
                 ParseOutcome::Segment(segment) => self.state.sig_seg.signal(Ok(segment)),
                 ParseOutcome::BlockInit(init) => self.state.sig_block_init.signal(Ok(init)),
@@ -371,13 +383,26 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         }
     }
 
-    async fn read_expedited_locked(&self, index: u16, sub: u8) -> Result<u32, SdoError<TX::Error>> {
+    /// Send an initiate-upload request; the server decides whether the reply
+    /// is expedited or announces a segmented transfer.
+    async fn initiate_upload_locked(
+        &self,
+        index: u16,
+        sub: u8,
+    ) -> Result<UploadInit, SdoError<TX::Error>> {
         self.request_response(
             SdoRequest::UploadExpedited { index, sub },
             Pending::ExpeditedRead { index, sub },
-            &self.state.sig_word,
+            &self.state.sig_upload_init,
         )
         .await
+    }
+
+    async fn read_expedited_locked(&self, index: u16, sub: u8) -> Result<u32, SdoError<TX::Error>> {
+        match self.initiate_upload_locked(index, sub).await? {
+            UploadInit::Expedited { data, .. } => Ok(u32::from_le_bytes(data)),
+            UploadInit::Segmented { .. } => Err(SdoError::NotExpedited),
+        }
     }
 
     async fn write_expedited_locked(
@@ -403,38 +428,55 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         index: u16,
         sub: u8,
         buf: &mut [u8],
-    ) -> Result<(), SdoError<TX::Error>> {
-        // Initiate the SDO with an expedited request to get the size of the data
-        let len = self.read_expedited_locked(index, sub).await?;
-        if len as usize > buf.len() {
-            return Err(SdoError::BufferSizeWrong);
-        }
-        let buf = &mut buf[..len as usize];
-
-        // Initiation successful, start requesting segments
-        let mut offset = 0usize;
-        let mut toggle = false;
-
-        loop {
-            let segment = self
-                .request_response(
-                    SdoRequest::UploadSegment { toggle },
-                    Pending::UploadSegment { toggle },
-                    &self.state.sig_seg,
-                )
-                .await?;
-
-            buf[offset..offset + segment.len].copy_from_slice(&segment.data[..segment.len]);
-            offset += segment.len;
-
-            if segment.last {
-                break;
+    ) -> Result<usize, SdoError<TX::Error>> {
+        match self.initiate_upload_locked(index, sub).await? {
+            // The server is free to answer expedited if the object fits in
+            // 4 bytes; deliver the data instead of desyncing the transfer.
+            UploadInit::Expedited { data, len } => {
+                if len > buf.len() {
+                    return Err(SdoError::BufferSizeWrong);
+                }
+                buf[..len].copy_from_slice(&data[..len]);
+                Ok(len)
             }
 
-            toggle = !toggle;
-        }
+            UploadInit::Segmented { size } => {
+                if let Some(size) = size {
+                    if size as usize > buf.len() {
+                        return Err(SdoError::BufferSizeWrong);
+                    }
+                }
 
-        Ok(())
+                // Initiation successful, start requesting segments
+                let mut offset = 0usize;
+                let mut toggle = false;
+
+                loop {
+                    let segment = self
+                        .request_response(
+                            SdoRequest::UploadSegment { toggle },
+                            Pending::UploadSegment { toggle },
+                            &self.state.sig_seg,
+                        )
+                        .await?;
+
+                    if offset + segment.len > buf.len() {
+                        return Err(SdoError::BufferSizeWrong);
+                    }
+                    buf[offset..offset + segment.len]
+                        .copy_from_slice(&segment.data[..segment.len]);
+                    offset += segment.len;
+
+                    if segment.last {
+                        break;
+                    }
+
+                    toggle = !toggle;
+                }
+
+                Ok(offset)
+            }
+        }
     }
 
     async fn write_segmented_locked(
@@ -482,7 +524,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         sub: u8,
         buf: &mut [u8],
         request_crc_support: bool,
-    ) -> Result<(), SdoError<TX::Error>> {
+    ) -> Result<usize, SdoError<TX::Error>> {
         const XMODEM: Crc<u16> = Crc::<u16>::new(&Algorithm {
             width: 16,
             poly: 0x1021,
@@ -615,7 +657,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
             .await
             .map_err(SdoError::TxError)?;
 
-        Ok(())
+        Ok(offset)
     }
 
     async fn write_block_locked<S: StreamReader<TX::Error> + StreamSeeker<TX::Error>>(
@@ -795,7 +837,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
 
     fn signal_error(&self, pending: Pending, err: SdoError<TX::Error>) {
         match pending {
-            Pending::ExpeditedRead { .. } => self.state.sig_word.signal(Err(err)),
+            Pending::ExpeditedRead { .. } => self.state.sig_upload_init.signal(Err(err)),
             Pending::ExpeditedWrite { .. }
             | Pending::SegmentedDownloadInit { .. }
             | Pending::DownloadSegment { .. }
