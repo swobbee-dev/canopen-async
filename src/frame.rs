@@ -44,7 +44,6 @@ impl From<u8> for NmtState {
 /// for one specific node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[allow(dead_code)] // consumed by NodeClient (introduced in the next commit)
 pub(crate) enum CobId {
     Sync,
     /// Emergency from the node (0x080 + node id)
@@ -69,7 +68,6 @@ pub(crate) enum CobId {
 }
 
 /// Classify a standard-frame COB-ID for the given node id.
-#[allow(dead_code)] // consumed by NodeClient (introduced in the next commit)
 pub(crate) fn classify(cob_id: u16, node_id: u8) -> CobId {
     match cob_id {
         0x000 => return CobId::Nmt,

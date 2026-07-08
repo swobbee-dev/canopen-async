@@ -1,14 +1,16 @@
 //! Client-level tests driving `SdoClient` through its public API with a mock
-//! CAN transport. Responses are injected via `on_frame_received`, exactly as
-//! an application RX task would.
+//! CAN transport. Responses are injected via `process_frame`, exactly as an
+//! application RX task would.
+
+mod common;
 
 use core::cell::RefCell;
 use std::rc::Rc;
 use std::vec::Vec;
 
 use canopen_async::{SdoClient, SdoError};
+use common::{MockTx, TestFrame};
 use embassy_time::Duration;
-use embedded_can::asynch::CanTx;
 use embedded_can::{Frame, Id, StandardId};
 use futures::executor::block_on;
 use futures::join;
@@ -19,64 +21,6 @@ const SDO_RX_ID: u16 = 0x600 + NODE_ID as u16; // client -> server
 
 const IDX: u16 = 0x2000;
 const SUB: u8 = 0x01;
-
-#[derive(Debug, Clone)]
-struct TestFrame {
-    id: Id,
-    data: Vec<u8>,
-}
-
-impl Frame for TestFrame {
-    fn new(id: impl Into<Id>, data: &[u8]) -> Option<Self> {
-        (data.len() <= 8).then(|| TestFrame {
-            id: id.into(),
-            data: data.to_vec(),
-        })
-    }
-
-    fn new_remote(id: impl Into<Id>, dlc: usize) -> Option<Self> {
-        (dlc <= 8).then(|| TestFrame {
-            id: id.into(),
-            data: std::vec![0; dlc],
-        })
-    }
-
-    fn is_extended(&self) -> bool {
-        matches!(self.id, Id::Extended(_))
-    }
-
-    fn is_remote_frame(&self) -> bool {
-        false
-    }
-
-    fn id(&self) -> Id {
-        self.id
-    }
-
-    fn dlc(&self) -> usize {
-        self.data.len()
-    }
-
-    fn data(&self) -> &[u8] {
-        &self.data
-    }
-}
-
-/// Records every transmitted frame; shared handle for assertions.
-#[derive(Clone, Default)]
-struct MockTx {
-    sent: Rc<RefCell<Vec<TestFrame>>>,
-}
-
-impl CanTx for MockTx {
-    type Frame = TestFrame;
-    type Error = core::convert::Infallible;
-
-    async fn transmit(&mut self, frame: &TestFrame) -> Result<(), Self::Error> {
-        self.sent.borrow_mut().push(frame.clone());
-        Ok(())
-    }
-}
 
 struct Harness {
     client: SdoClient<TestFrame, MockTx>,
