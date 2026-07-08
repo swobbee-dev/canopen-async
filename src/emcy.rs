@@ -1,4 +1,10 @@
-//! Emergency object (EMCY) parsing (CiA 301, 7.2.7).
+//! Emergency object (EMCY) parsing and per-node monitoring (CiA 301, 7.2.7).
+
+use core::cell::Cell;
+
+use embassy_sync::blocking_mutex::Mutex;
+use embassy_sync::blocking_mutex::raw::RawMutex;
+use embassy_sync::signal::Signal;
 
 /// A received emergency message.
 ///
@@ -38,6 +44,53 @@ impl EmcyMessage {
     }
 }
 
+/// Tracks emergency messages from one node: latest message, whether an
+/// error is currently active (cleared by an "error reset" EMCY), and an
+/// async waiter. Fed by [`NodeClient::handle_frame`](crate::NodeClient).
+pub struct EmcyMonitor<M: RawMutex> {
+    latest: Mutex<M, Cell<Option<EmcyMessage>>>,
+    received: Signal<M, EmcyMessage>,
+}
+
+impl<M: RawMutex> EmcyMonitor<M> {
+    pub const fn new() -> Self {
+        Self {
+            latest: Mutex::new(Cell::new(None)),
+            received: Signal::new(),
+        }
+    }
+
+    /// Record a received EMCY. Synchronous, safe from any RX context.
+    pub(crate) fn on_emcy(&self, msg: EmcyMessage) {
+        self.latest.lock(|latest| latest.set(Some(msg)));
+        self.received.signal(msg);
+    }
+
+    /// The most recent EMCY received, if any.
+    pub fn latest(&self) -> Option<EmcyMessage> {
+        self.latest.lock(|latest| latest.get())
+    }
+
+    /// Whether the node's last EMCY reported an error (and no error reset
+    /// has been received since).
+    pub fn error_active(&self) -> bool {
+        self.latest().is_some_and(|msg| !msg.is_error_reset())
+    }
+
+    /// Wait for the next EMCY received *after* this call; a previously
+    /// stored message is discarded first.
+    pub async fn wait_emcy(&self) -> EmcyMessage {
+        self.received.reset();
+        self.received.wait().await
+    }
+}
+
+impl<M: RawMutex> Default for EmcyMonitor<M> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,5 +117,40 @@ mod tests {
     fn parse_error_reset() {
         let msg = EmcyMessage::parse(&[0, 0, 0, 0, 0, 0, 0, 0]);
         assert!(msg.is_error_reset());
+    }
+
+    #[test]
+    fn monitor_tracks_active_error_and_reset() {
+        use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+        let mon: EmcyMonitor<CriticalSectionRawMutex> = EmcyMonitor::new();
+        assert!(!mon.error_active());
+        assert_eq!(mon.latest(), None);
+
+        let error = EmcyMessage::parse(&[0x01, 0x10, 0x81, 0, 0, 0, 0, 0]);
+        mon.on_emcy(error);
+        assert!(mon.error_active());
+        assert_eq!(mon.latest(), Some(error));
+
+        // Error reset clears the active flag but stays visible as latest
+        let reset = EmcyMessage::parse(&[0, 0, 0, 0, 0, 0, 0, 0]);
+        mon.on_emcy(reset);
+        assert!(!mon.error_active());
+        assert_eq!(mon.latest(), Some(reset));
+    }
+
+    #[test]
+    fn monitor_wait_discards_stale_message() {
+        use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+        use futures::FutureExt;
+
+        let mon: EmcyMonitor<CriticalSectionRawMutex> = EmcyMonitor::new();
+        mon.on_emcy(EmcyMessage::parse(&[0x01, 0x10, 0x81])); // stale
+
+        let mut fut = core::pin::pin!(mon.wait_emcy());
+        assert!(fut.as_mut().now_or_never().is_none());
+
+        let fresh = EmcyMessage::parse(&[0x02, 0x10, 0x81]);
+        mon.on_emcy(fresh);
+        assert_eq!(fut.now_or_never(), Some(fresh));
     }
 }

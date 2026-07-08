@@ -78,6 +78,50 @@ impl<M: RawMutex, T: PdoPayload + Send> Default for PdoSlot<M, T> {
     }
 }
 
+/// One PDO mapping entry: which object (index/sub) occupies how many bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct PdoMappingEntry {
+    pub index: u16,
+    pub sub: u8,
+    pub bit_len: u8,
+}
+
+impl PdoMappingEntry {
+    pub const fn new(index: u16, sub: u8, bit_len: u8) -> Self {
+        Self { index, sub, bit_len }
+    }
+
+    /// The 32-bit value written to the mapping parameter object
+    /// (CiA 301, 7.5.2.36: index << 16 | sub << 8 | bit length).
+    pub(crate) const fn raw(self) -> u32 {
+        (self.index as u32) << 16 | (self.sub as u32) << 8 | self.bit_len as u32
+    }
+}
+
+/// Configuration written to a node's PDO communication and mapping
+/// parameter objects via [`NodeClient::configure_tpdo`] /
+/// [`configure_rpdo`](crate::NodeClient::configure_rpdo).
+///
+/// [`NodeClient::configure_tpdo`]: crate::NodeClient::configure_tpdo
+#[derive(Debug, Clone, Copy)]
+pub struct PdoConfig<'a> {
+    /// COB-ID for this PDO; `None` uses the predefined connection set
+    /// default for the PDO number and node id.
+    pub cob_id: Option<u32>,
+    /// CiA 301 transmission type (0/1..=240 synchronous, 254/255
+    /// event-driven).
+    pub transmission_type: u8,
+    /// Inhibit time in multiples of 100 µs (communication sub-index 3);
+    /// skipped if `None`. TPDOs only on most devices.
+    pub inhibit_time: Option<u16>,
+    /// Event timer in ms (communication sub-index 5); skipped if `None`.
+    /// Transmission period for TPDOs, deadline monitoring for RPDOs.
+    pub event_timer: Option<u16>,
+    /// Mapping entries, at most 8 (64 bits per classic CAN PDO).
+    pub mappings: &'a [PdoMappingEntry],
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

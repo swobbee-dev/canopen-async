@@ -933,6 +933,13 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         self.can_tx.lock().await.transmit(&frame).await
     }
 
+    /// Transmit an arbitrary frame through the client's transmitter. Used by
+    /// [`NodeClient`](crate::NodeClient) for the non-SDO traffic (NMT, SYNC,
+    /// RPDOs) that shares the bus handle.
+    pub(crate) async fn transmit_raw(&self, frame: &FRAME) -> Result<(), TX::Error> {
+        self.can_tx.lock().await.transmit(frame).await
+    }
+
     /// Send an abort for the transfer on `index`/`sub` and return the
     /// matching error. Used where the client itself detects a protocol
     /// violation mid-transfer.

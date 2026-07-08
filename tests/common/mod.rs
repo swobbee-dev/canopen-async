@@ -50,10 +50,13 @@ impl Frame for TestFrame {
     }
 }
 
+/// Shared handle to the frames a [`MockTx`] has transmitted.
+pub type SentFrames = Rc<RefCell<Vec<TestFrame>>>;
+
 /// Records every transmitted frame; clone the `sent` handle for assertions.
 #[derive(Clone, Default)]
 pub struct MockTx {
-    pub sent: Rc<RefCell<Vec<TestFrame>>>,
+    pub sent: SentFrames,
 }
 
 impl CanTx for MockTx {

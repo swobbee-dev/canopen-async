@@ -6,9 +6,13 @@
 //! - [`NodeClient`]: per-node frame dispatch — feed received frames in, get
 //!   typed [`NodeEvent`]s (heartbeat, EMCY, PDO, SYNC) out
 //! - [`SdoClient`]: expedited, segmented and block SDO transfers
-//! - [`pdo`]: typed PDO reception via [`PdoPayload`] and [`PdoSlot`]
-//! - [`EmcyMessage`]: emergency object parsing
-//! - NMT master commands ([`NodeClient::send_nmt`])
+//! - [`HeartbeatMonitor`]: liveness supervision, fed by the dispatcher
+//! - [`EmcyMonitor`]: emergency tracking, fed by the dispatcher
+//! - [`pdo`]: typed PDO reception via [`PdoPayload`] and [`PdoSlot`], plus
+//!   remote PDO reconfiguration over SDO ([`NodeClient::configure_tpdo`])
+//! - NMT master commands, SYNC production, RPDO transmission
+//!   ([`NodeClient::send_nmt`] / [`send_sync`](NodeClient::send_sync) /
+//!   [`send_rpdo`](NodeClient::send_rpdo))
 //!
 //! The library is transport-agnostic over the async [`embedded_can`] traits
 //! and executor-agnostic (no embassy executor required; timeouts use
@@ -19,14 +23,16 @@
 
 mod emcy;
 mod frame;
+mod heartbeat;
 mod node;
 pub mod pdo;
 mod protocol;
 mod sdo;
 
-pub use emcy::EmcyMessage;
+pub use emcy::{EmcyMessage, EmcyMonitor};
 pub use frame::{NmtCommand, NmtState};
+pub use heartbeat::HeartbeatMonitor;
 pub use node::{NodeClient, NodeEvent};
-pub use pdo::{PdoPayload, PdoSlot};
+pub use pdo::{PdoConfig, PdoMappingEntry, PdoPayload, PdoSlot};
 pub use protocol::{BlockAck, BlockInit, BlockUploadInit, BlockUploadSegment, Segment};
 pub use sdo::{SdoClient, SdoError, SeekFrom, StreamReader, StreamSeeker};
