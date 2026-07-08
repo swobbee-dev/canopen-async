@@ -307,6 +307,47 @@ fn crc_mismatch_sends_abort() {
     assert_eq!(h.sent_payloads().last().unwrap(), &abort_payload(0x0504_0004));
 }
 
+#[test]
+fn write_segmented_empty_data_sends_empty_last_segment() {
+    // Regression: a zero-length download sent the size-0 initiate and then
+    // no segment at all, leaving the server waiting forever.
+    let h = Harness::new();
+    let result = run_with_responses(
+        &h,
+        h.client.write_segmented(IDX, SUB, &[]),
+        vec![
+            Harness::response(0x60, [0; 4]),                     // initiate ack
+            Harness::raw_response(&[0x20, 0, 0, 0, 0, 0, 0, 0]), // segment ack, toggle 0
+        ],
+    );
+    assert!(result.is_ok());
+
+    let sent = h.sent_payloads();
+    assert_eq!(sent.len(), 2);
+    // Empty last segment: cs = 000_0_111_1 (toggle 0, n=7, c=1)
+    assert_eq!(sent[1], vec![0x0F, 0, 0, 0, 0, 0, 0, 0]);
+}
+
+#[test]
+fn stale_frame_does_not_eat_pending_request() {
+    // Regression: any frame on the SDO response COB-ID consumed the pending
+    // state, so a stale/duplicated frame turned the real response into a
+    // timeout. A frame whose command specifier cannot belong to the pending
+    // request must be ignored.
+    let h = Harness::new();
+    let result = run_with_batches(
+        &h,
+        h.client.read_expedited(IDX, SUB),
+        vec![vec![
+            // Stale download ack (cs 0x60) — cannot answer an initiate upload
+            Harness::response(0x60, [0; 4]),
+            // The real expedited response
+            Harness::response(0x4B, [0x34, 0x12, 0, 0]),
+        ]],
+    );
+    assert_eq!(result.unwrap(), 0x1234);
+}
+
 /// XMODEM CRC over `data`, as used by SDO block transfers.
 fn block_crc(data: &[u8]) -> u16 {
     crc::Crc::<u16>::new(&crc::CRC_16_XMODEM).checksum(data)

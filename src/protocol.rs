@@ -309,6 +309,29 @@ pub(crate) fn parse_response(pending: Pending, data: &[u8]) -> Result<ParseOutco
     }
 }
 
+/// Whether a response's command specifier can belong to the pending request.
+///
+/// Used to ignore stale or duplicated frames instead of letting them consume
+/// the pending state, which would turn the real response into a timeout.
+/// Matching is by server command specifier class (upper 3 bits); an abort
+/// (0x80) applies to any pending request.
+pub(crate) fn response_matches(pending: Pending, command: u8) -> bool {
+    if command == 0x80 {
+        return true;
+    }
+    let scs = command & 0xE0;
+    match pending {
+        Pending::ExpeditedRead { .. } => scs == 0x40, // initiate upload response
+        Pending::ExpeditedWrite { .. } | Pending::SegmentedDownloadInit { .. } => command == 0x60,
+        Pending::UploadSegment { .. } => scs == 0x00,
+        Pending::DownloadSegment { .. } => scs == 0x20,
+        Pending::BlockDownloadInitiate { .. } | Pending::BlockDownloadAck | Pending::BlockDownloadEnd => scs == 0xA0,
+        Pending::BlockUploadInitiate { .. } | Pending::BlockUploadEndWait => scs == 0xC0,
+        // Segments start with a sequence byte; any value is possible.
+        Pending::BlockUploadActive => true,
+    }
+}
+
 /// Validate the index/sub-index echoed by the server against the request.
 fn check_multiplexer(data: &[u8], index: u16, sub: u8) -> Result<(), ParseError> {
     let response_index = u16::from_le_bytes(data[1..3].try_into().unwrap());

@@ -340,6 +340,23 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
             return; // Not an SDO response for this node
         }
 
+        // Ignore frames that cannot belong to the pending request (stale or
+        // duplicated responses): consuming the pending state for them would
+        // turn the real response into a timeout.
+        {
+            let pending = self.state.pending.borrow();
+            let Some(pending) = *pending else {
+                // Frame arrived after a timeout but before the guard dropped
+                return;
+            };
+            let Some(&command) = frame.data().first() else {
+                return; // Empty frame is never a valid SDO response
+            };
+            if !protocol::response_matches(pending, command) {
+                return;
+            }
+        }
+
         // For BlockUploadActive, we peek instead of taking, to avoid race conditions.
         let mut is_block_upload_active = false;
         if let Some(Pending::BlockUploadActive) = *self.state.pending.borrow() {
@@ -506,6 +523,22 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
             &self.state.sig_ack,
         )
         .await?;
+
+        // A zero-length download still requires one (empty) last segment,
+        // otherwise the server waits for data forever.
+        if data.is_empty() {
+            return self
+                .request_response(
+                    SdoRequest::DownloadSegment {
+                        toggle: false,
+                        last: true,
+                        data: &[],
+                    },
+                    Pending::DownloadSegment { toggle: false },
+                    &self.state.sig_ack,
+                )
+                .await;
+        }
 
         // Send segments
         let mut toggle = false;
