@@ -1,5 +1,9 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 #![allow(async_fn_in_trait)]
+
+mod protocol;
+
+pub use protocol::{BlockAck, BlockInit, BlockUploadInit, BlockUploadSegment, Segment};
 
 use core::cell::RefCell;
 use crc::{Algorithm, Crc};
@@ -8,10 +12,14 @@ use embassy_sync::{
 };
 use embassy_time::Duration;
 use embedded_can::{Frame, Id, StandardId, asynch::CanTx};
-
-const ABORT_INVALID_BLOCK_SIZE: u32 = 0x05040002;
-const ABORT_SEQ_NUM_ERROR: u32 = 0x05040003;
-const ABORT_CRC_ERROR: u32 = 0x05040004;
+use protocol::{
+    ABORT_CRC_ERROR, ABORT_INVALID_BLOCK_SIZE, ABORT_SEQ_NUM_ERROR, ParseOutcome, Pending,
+    encode_block_download_segment, encode_block_upload_ack, encode_download_expedited,
+    encode_download_segment, encode_end_block_download, encode_end_block_upload_confirmation,
+    encode_initiate_block_download, encode_initiate_block_upload,
+    encode_initiate_segmented_download, encode_start_block_upload, encode_upload_request,
+    encode_upload_segment_request, parse_response,
+};
 
 // CiA 301 Version 4.2.0, page 72ff
 // cs: command specifier
@@ -133,58 +141,6 @@ enum SdoRequest<'a> {
         last: bool,
         data: &'a [u8],
     },
-}
-
-#[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-enum Pending {
-    ExpeditedRead { index: u16, sub: u8 },
-    ExpeditedWrite { index: u16, sub: u8 },
-    SegmentedDownloadInit { index: u16, sub: u8 },
-    UploadSegment { toggle: bool },
-    DownloadSegment { toggle: bool },
-    BlockDownloadInitiate { index: u16, sub: u8 },
-    BlockDownloadAck,
-    BlockDownloadEnd,
-    BlockUploadInitiate { index: u16, sub: u8 },
-    BlockUploadActive,
-    BlockUploadEndWait,
-}
-
-#[derive(Copy, Clone)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct Segment {
-    last: bool,
-    len: usize,
-    data: [u8; 7],
-}
-
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct BlockInit {
-    blksize: u8,
-    server_supports_crc: bool,
-}
-
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct BlockAck {
-    ackseq: u8,
-    next_blksize: u8,
-}
-
-#[derive(Debug)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct BlockUploadInit {
-    size: Option<u32>,
-    server_supports_crc: bool,
-}
-
-#[derive(Copy, Clone)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct BlockUploadSegment {
-    last: bool,
-    seqno: u8,
-    len: usize,
-    data: [u8; 7],
 }
 
 struct PendingGuard<'a> {
@@ -381,200 +337,18 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
             return;
         };
 
-        if frame.data().len() != 8 {
-            let err = SdoError::InvalidResponse;
-            self.signal_error(pending_request, err);
-            return;
-        }
-
-        let command = frame.data()[0];
-        if command == 0x80 {
-            // SDO Abort
-            let abort_code = u32::from_le_bytes(frame.data()[4..8].try_into().unwrap());
-            self.signal_error(pending_request, SdoError::SdoAbort(abort_code));
-            return;
-        }
-
-        match pending_request {
-            Pending::ExpeditedRead { index, sub } => {
-                let response_index = u16::from_le_bytes(frame.data()[1..3].try_into().unwrap());
-                let response_sub = frame.data()[3];
-                if response_index != index || response_sub != sub {
-                    self.state.sig_word.signal(Err(SdoError::InvalidResponse));
-                    return;
+        match parse_response(pending_request, frame.data()) {
+            Err(err) => self.signal_error(pending_request, err.into_sdo_error()),
+            Ok(outcome) => match outcome {
+                ParseOutcome::Word(word) => self.state.sig_word.signal(Ok(word)),
+                ParseOutcome::Ack => self.state.sig_ack.signal(Ok(())),
+                ParseOutcome::Segment(segment) => self.state.sig_seg.signal(Ok(segment)),
+                ParseOutcome::BlockInit(init) => self.state.sig_block_init.signal(Ok(init)),
+                ParseOutcome::BlockAck(ack) => self.state.sig_block_ack.signal(Ok(ack)),
+                ParseOutcome::BlockUploadInit(init) => {
+                    self.state.sig_block_upload_init.signal(Ok(init))
                 }
-
-                match command {
-                    // Expedited Upload Response (e.g. 0x43, 0x47, 0x4B, 0x4F)
-                    0x43 | 0x47 | 0x4B | 0x4F => {
-                        let n_unused = ((command & 0x0C) >> 2) as usize;
-                        let data_len = 4 - n_unused;
-                        let mut bytes = [0u8; 4];
-                        bytes[..data_len].copy_from_slice(&frame.data()[4..4 + data_len]);
-                        self.state.sig_word.signal(Ok(u32::from_le_bytes(bytes)));
-                    }
-                    // Segmented Upload Initiation Response
-                    0x41 => {
-                        let size = u32::from_le_bytes(frame.data()[4..8].try_into().unwrap());
-                        self.state.sig_word.signal(Ok(size));
-                    }
-                    _ => {
-                        self.state.sig_word.signal(Err(SdoError::InvalidResponse));
-                    }
-                }
-            }
-
-            Pending::ExpeditedWrite { index, sub }
-            | Pending::SegmentedDownloadInit { index, sub } => {
-                let response_index = u16::from_le_bytes(frame.data()[1..3].try_into().unwrap());
-                let response_sub = frame.data()[3];
-                if response_index != index || response_sub != sub {
-                    self.state.sig_ack.signal(Err(SdoError::InvalidResponse));
-                    return;
-                }
-
-                if command == 0x60 {
-                    self.state.sig_ack.signal(Ok(()));
-                } else {
-                    self.state.sig_ack.signal(Err(SdoError::InvalidResponse));
-                }
-            }
-
-            Pending::UploadSegment { toggle } => {
-                // Segment Upload Response: cs = 000t nnnc b
-                if (command & 0xE0) == 0x00 {
-                    let response_toggle = (command & 0x10) != 0;
-                    if response_toggle != toggle {
-                        self.state.sig_seg.signal(Err(SdoError::InvalidResponse));
-                        return;
-                    }
-
-                    let last = (command & 0x01) != 0;
-                    let n_unused = ((command & 0x0E) >> 1) as usize;
-                    let len = 7 - n_unused;
-                    let mut data = [0u8; 7];
-                    data[..len].copy_from_slice(&frame.data()[1..1 + len]);
-                    let segment = Segment { last, len, data };
-                    self.state.sig_seg.signal(Ok(segment));
-                } else {
-                    self.state.sig_seg.signal(Err(SdoError::InvalidResponse));
-                }
-            }
-
-            Pending::DownloadSegment { toggle } => {
-                // Download Segment Response: cs = 001t 0000 b
-                if (command & 0b1110_1111) == 0b0010_0000 {
-                    let response_toggle = (command & 0b0001_0000) != 0;
-                    if response_toggle == toggle {
-                        self.state.sig_ack.signal(Ok(()));
-                    } else {
-                        self.state.sig_ack.signal(Err(SdoError::InvalidResponse));
-                    }
-                } else {
-                    self.state.sig_ack.signal(Err(SdoError::InvalidResponse));
-                }
-            }
-            Pending::BlockDownloadInitiate { index, sub } => {
-                // Response to initiate block download: cs = 10100r00b
-                if (command & 0b1111_1011) == 0b1010_0000 {
-                    let response_index = u16::from_le_bytes(frame.data()[1..3].try_into().unwrap());
-                    let response_sub = frame.data()[3];
-                    if response_index != index || response_sub != sub {
-                        self.state
-                            .sig_block_init
-                            .signal(Err(SdoError::InvalidResponse));
-                        return;
-                    }
-                    let blksize = frame.data()[4];
-                    let server_supports_crc = (command & 0b0000_0100) != 0;
-
-                    let block_init = BlockInit {
-                        blksize,
-                        server_supports_crc,
-                    };
-                    self.state.sig_block_init.signal(Ok(block_init));
-                } else {
-                    self.state
-                        .sig_block_init
-                        .signal(Err(SdoError::InvalidResponse));
-                }
-            }
-
-            Pending::BlockDownloadAck => {
-                // Response to sub-block: cs = 10100010b
-                if command == 0xA2 {
-                    let ackseq = frame.data()[1];
-                    let next_blksize = frame.data()[2];
-                    let block_ack = BlockAck {
-                        ackseq,
-                        next_blksize,
-                    };
-                    self.state.sig_block_ack.signal(Ok(block_ack));
-                } else {
-                    self.state
-                        .sig_block_ack
-                        .signal(Err(SdoError::InvalidResponse));
-                }
-            }
-
-            Pending::BlockDownloadEnd => {
-                // Response to end download: cs = 10100001b
-                if command == 0xA1 {
-                    // 10100001b
-                    self.state.sig_ack.signal(Ok(()));
-                } else {
-                    self.state.sig_ack.signal(Err(SdoError::InvalidResponse));
-                }
-            }
-
-            Pending::BlockUploadInitiate { index, sub } => {
-                // Response to initiate block upload: cs = 11000rs0b
-                if (command & 0b1111_1001) == 0b1100_0000 {
-                    let response_index = u16::from_le_bytes(frame.data()[1..3].try_into().unwrap());
-                    let response_sub = frame.data()[3];
-                    if response_index != index || response_sub != sub {
-                        self.state
-                            .sig_block_upload_init
-                            .signal(Err(SdoError::InvalidResponse));
-                        return;
-                    }
-
-                    let server_supports_crc = (command & 0b0000_0100) != 0;
-                    let size_indicated = (command & 0b0000_0010) != 0;
-
-                    let size = if size_indicated {
-                        Some(u32::from_le_bytes(frame.data()[4..8].try_into().unwrap()))
-                    } else {
-                        None
-                    };
-
-                    let upload_init = BlockUploadInit {
-                        size,
-                        server_supports_crc,
-                    };
-                    self.state.sig_block_upload_init.signal(Ok(upload_init));
-                } else {
-                    self.state
-                        .sig_block_upload_init
-                        .signal(Err(SdoError::InvalidResponse));
-                }
-            }
-
-            Pending::BlockUploadActive => {
-                let seqno = command & 0x7F;
-                if seqno > 0 && seqno <= 127 {
-                    let last = (command & 0x80) != 0;
-                    let len = 7;
-                    let mut data = [0u8; 7];
-                    data.copy_from_slice(&frame.data()[1..8]);
-
-                    let segment = BlockUploadSegment {
-                        last,
-                        seqno,
-                        len,
-                        data,
-                    };
-
+                ParseOutcome::BlockUploadSegment(segment) => {
                     if self
                         .state
                         .block_upload_seg_chan
@@ -586,33 +360,15 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                     }
 
                     // If it was the last segment of the whole transfer, consume the pending state.
-                    if last {
+                    if segment.last {
                         *self.state.pending.borrow_mut() = None;
                     }
-                } else {
-                    if self
-                        .state
-                        .block_upload_seg_chan
-                        .try_send(Err(SdoError::InvalidResponse))
-                        .is_err()
-                    {
-                        // queue is full, dropping error.
-                    }
                 }
-            }
-
-            Pending::BlockUploadEndWait => {
-                // Must be the end of upload frame from server: cs = 110nnn01b
-                if (command & 0b11100011) == 0b11000001 {
-                    let crc = u16::from_le_bytes(frame.data()[1..3].try_into().unwrap());
-                    self.state.sig_block_upload_end.signal(Ok(crc));
-                } else {
-                    self.state
-                        .sig_block_upload_end
-                        .signal(Err(SdoError::InvalidResponse));
+                ParseOutcome::BlockUploadEnd { crc } => {
+                    self.state.sig_block_upload_end.signal(Ok(crc))
                 }
-            }
-        };
+            },
+        }
     }
 
     async fn read_expedited_locked(&self, index: u16, sub: u8) -> Result<u32, SdoError<TX::Error>> {
@@ -1061,14 +817,15 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
 
     // ## --- HELPER SENDER FUNCTIONS --- ##
 
-    async fn send_sdo_upload_request(&self, index: u16, subindex: u8) -> Result<(), TX::Error> {
+    /// Transmit an SDO request payload to the server (COB-ID 0x600 + node id).
+    async fn send_payload(&self, payload: &[u8; 8]) -> Result<(), TX::Error> {
         let id = 0x600 + (self.node_id as u16);
-        let mut payload = [0u8; 8];
-        payload[0] = 0x40; // Initiate Upload Request
-        payload[1..3].copy_from_slice(&index.to_le_bytes());
-        payload[3] = subindex;
-        let frame = FRAME::new(Id::Standard(StandardId::new(id).unwrap()), &payload).unwrap();
+        let frame = FRAME::new(Id::Standard(StandardId::new(id).unwrap()), payload).unwrap();
         self.can_tx.lock().await.transmit(&frame).await
+    }
+
+    async fn send_sdo_upload_request(&self, index: u16, subindex: u8) -> Result<(), TX::Error> {
+        self.send_payload(&encode_upload_request(index, subindex)).await
     }
 
     async fn send_sdo_download_request(
@@ -1077,20 +834,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         subindex: u8,
         data: &[u8],
     ) -> Result<(), TX::Error> {
-        let id = 0x600 + (self.node_id as u16);
-        let mut payload = [0u8; 8];
-
-        let len = data.len();
-        let n = 4 - len;
-        // Expedited download CS: 001_0_nn_11 b
-        payload[0] = 0b0010_0011 | ((n as u8) << 2);
-
-        payload[1..3].copy_from_slice(&index.to_le_bytes());
-        payload[3] = subindex;
-        payload[4..4 + len].copy_from_slice(data);
-
-        let frame = FRAME::new(Id::Standard(StandardId::new(id).unwrap()), &payload).unwrap();
-        self.can_tx.lock().await.transmit(&frame).await
+        self.send_payload(&encode_download_expedited(index, subindex, data)).await
     }
 
     async fn send_initiate_segmented_download(
@@ -1099,15 +843,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         sub: u8,
         size: u32,
     ) -> Result<(), TX::Error> {
-        let id = 0x600 + (self.node_id as u16);
-        let mut payload = [0u8; 8];
-        payload[0] = 0x21; // Initiate Segmented Download, size is indicated
-        payload[1..3].copy_from_slice(&index.to_le_bytes());
-        payload[3] = sub;
-        payload[4..8].copy_from_slice(&size.to_le_bytes());
-
-        let frame = FRAME::new(Id::Standard(StandardId::new(id).unwrap()), &payload).unwrap();
-        self.can_tx.lock().await.transmit(&frame).await
+        self.send_payload(&encode_initiate_segmented_download(index, sub, size)).await
     }
 
     async fn send_sdo_download_segment(
@@ -1116,34 +852,11 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         toggle: bool,
         last: bool,
     ) -> Result<(), TX::Error> {
-        let id = 0x600 + (self.node_id as u16);
-        let mut payload = [0u8; 8];
-
-        let n = 7 - segment_data.len();
-        // Download Segment CS: 000t nnnc b
-        let mut cs: u8 = 0;
-        if toggle {
-            cs |= 0b0001_0000;
-        }
-        cs |= (n as u8) << 1;
-        if last {
-            cs |= 0b0000_0001;
-        }
-
-        payload[0] = cs;
-        payload[1..1 + segment_data.len()].copy_from_slice(segment_data);
-
-        let frame = FRAME::new(Id::Standard(StandardId::new(id).unwrap()), &payload).unwrap();
-        self.can_tx.lock().await.transmit(&frame).await
+        self.send_payload(&encode_download_segment(segment_data, toggle, last)).await
     }
 
     async fn send_sdo_request_upload_segment(&self, toggle: bool) -> Result<(), TX::Error> {
-        let id = 0x600 + (self.node_id as u16);
-        let mut payload = [0u8; 8];
-        // Upload SDO Segment Request: 011t 0000 b
-        payload[0] = 0x60 | if toggle { 0x10 } else { 0x00 };
-        let frame = FRAME::new(Id::Standard(StandardId::new(id).unwrap()), &payload).unwrap();
-        self.can_tx.lock().await.transmit(&frame).await
+        self.send_payload(&encode_upload_segment_request(toggle)).await
     }
 
     async fn send_initiate_block_download(
@@ -1153,22 +866,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         size: u32,
         crc: bool,
     ) -> Result<(), TX::Error> {
-        let id = 0x600 + (self.node_id as u16);
-        let mut payload = [0u8; 8];
-        // Initiate block download CS: 11000rs0b
-        let mut cs = 0b1100_0000;
-        if crc {
-            cs |= 0b0000_0100; // r bit (CRC support)
-        }
-        cs |= 0b0000_0010; // s bit (size indicated)
-
-        payload[0] = cs;
-        payload[1..3].copy_from_slice(&index.to_le_bytes());
-        payload[3] = sub;
-        payload[4..8].copy_from_slice(&size.to_le_bytes());
-
-        let frame = FRAME::new(Id::Standard(StandardId::new(id).unwrap()), &payload).unwrap();
-        self.can_tx.lock().await.transmit(&frame).await
+        self.send_payload(&encode_initiate_block_download(index, sub, size, crc)).await
     }
 
     async fn send_block_download_segment(
@@ -1177,33 +875,12 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         seqno: u8,
         last_segment: bool,
     ) -> Result<(), TX::Error> {
-        let id = 0x600 + (self.node_id as u16);
-        let mut payload = [0u8; 8];
-
-        // Download block segment CS: cnnnnnnnb
-        let mut cs = seqno;
-        if last_segment {
-            cs |= 0x80; // c bit
-        }
-
-        payload[0] = cs;
-        payload[1..1 + segment_data.len()].copy_from_slice(segment_data);
-
-        let frame = FRAME::new(Id::Standard(StandardId::new(id).unwrap()), &payload).unwrap();
-        self.can_tx.lock().await.transmit(&frame).await
+        self.send_payload(&encode_block_download_segment(segment_data, seqno, last_segment))
+            .await
     }
 
     async fn send_end_block_download(&self, unused_bytes: u8, crc: u16) -> Result<(), TX::Error> {
-        let id = 0x600 + (self.node_id as u16);
-        let mut payload = [0u8; 8];
-        // End block download CS: 110nnn01b
-        let cs = 0b1100_0001 | (unused_bytes << 2);
-
-        payload[0] = cs;
-        payload[1..3].copy_from_slice(&crc.to_le_bytes());
-
-        let frame = FRAME::new(Id::Standard(StandardId::new(id).unwrap()), &payload).unwrap();
-        self.can_tx.lock().await.transmit(&frame).await
+        self.send_payload(&encode_end_block_download(unused_bytes, crc)).await
     }
 
     async fn send_initiate_block_upload(
@@ -1213,52 +890,18 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         blksize: u8,
         crc: bool,
     ) -> Result<(), TX::Error> {
-        let id = 0x600 + (self.node_id as u16);
-        let mut payload = [0u8; 8];
-        // Initiate block upload CS: 10100r00b
-        let mut cs = 0b1010_0000;
-        if crc {
-            cs |= 0b0000_0100; // r bit (CRC support)
-        }
-
-        payload[0] = cs;
-        payload[1..3].copy_from_slice(&index.to_le_bytes());
-        payload[3] = sub;
-        payload[4] = blksize;
-
-        let frame = FRAME::new(Id::Standard(StandardId::new(id).unwrap()), &payload).unwrap();
-        self.can_tx.lock().await.transmit(&frame).await
+        self.send_payload(&encode_initiate_block_upload(index, sub, blksize, crc)).await
     }
 
     async fn send_start_block_upload(&self) -> Result<(), TX::Error> {
-        let id = 0x600 + (self.node_id as u16);
-        let mut payload = [0u8; 8];
-        // Start upload CS: 10100011b
-        payload[0] = 0xA3;
-
-        let frame = FRAME::new(Id::Standard(StandardId::new(id).unwrap()), &payload).unwrap();
-        self.can_tx.lock().await.transmit(&frame).await
+        self.send_payload(&encode_start_block_upload()).await
     }
 
     async fn send_block_upload_ack(&self, ackseq: u8, blksize: u8) -> Result<(), TX::Error> {
-        let id = 0x600 + (self.node_id as u16);
-        let mut payload = [0u8; 8];
-        // Upload sub-block response CS: 10100010b
-        payload[0] = 0xA2;
-        payload[1] = ackseq;
-        payload[2] = blksize;
-
-        let frame = FRAME::new(Id::Standard(StandardId::new(id).unwrap()), &payload).unwrap();
-        self.can_tx.lock().await.transmit(&frame).await
+        self.send_payload(&encode_block_upload_ack(ackseq, blksize)).await
     }
 
     async fn send_end_block_upload_confirmation(&self) -> Result<(), TX::Error> {
-        let id = 0x600 + (self.node_id as u16);
-        let mut payload = [0u8; 8];
-        // Upload end response CS: 10100001b
-        payload[0] = 0xA1;
-
-        let frame = FRAME::new(Id::Standard(StandardId::new(id).unwrap()), &payload).unwrap();
-        self.can_tx.lock().await.transmit(&frame).await
+        self.send_payload(&encode_end_block_upload_confirmation()).await
     }
 }
