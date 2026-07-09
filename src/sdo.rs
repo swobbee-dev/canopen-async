@@ -931,11 +931,14 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
     ///
     /// Uses expedited or segmented transfer as the server chooses. A server
     /// response shorter than the type is zero-extended (some devices do not
-    /// indicate a size); a longer response fails with `BufferSizeWrong`.
+    /// indicate a size). A longer response decodes from the low `T::SIZE`
+    /// bytes: devices commonly pad expedited replies to the full 4 bytes
+    /// (e.g. the lime BMS mandates this), and little-endian truncation is
+    /// correct for both zero-padded and sign-extended values. Responses
+    /// longer than 8 bytes fail with `BufferSizeWrong`.
     pub async fn read<T: SdoScalar>(&self, entry: SdoEntry<T>) -> Result<T, SdoError<TX::Error>> {
         let mut buf = [0u8; 8];
-        self.read_segmented(entry.index, entry.sub, &mut buf[..T::SIZE])
-            .await?;
+        self.read_segmented(entry.index, entry.sub, &mut buf).await?;
         Ok(T::from_le_bytes(&buf[..T::SIZE]))
     }
 

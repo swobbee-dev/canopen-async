@@ -310,6 +310,45 @@ mod typed {
     }
 
     #[test]
+    fn read_scalar_from_padded_expedited_reply() {
+        // The lime BMS pads every expedited response to 4 bytes (cs 0x43,
+        // "size indicated: 4") regardless of the object's size. The typed
+        // read must decode from the low bytes instead of rejecting the
+        // oversized payload.
+        let h = Harness::new();
+        const SOH: SdoEntry<u8> = SdoEntry::new(IDX, SUB, "state of health");
+        let result = run_with_responses(
+            &h,
+            h.client.read(SOH),
+            vec![Harness::response(0x43, [87, 0, 0, 0])],
+        );
+        assert_eq!(result.unwrap(), 87u8);
+    }
+
+    #[test]
+    fn read_i16_negative_from_padded_reply() {
+        // -80 (deci-degC) as an i16 inside a 4-byte reply: correct for a
+        // zero-padding server...
+        let h = Harness::new();
+        const TEMP: SdoEntry<i16> = SdoEntry::new(IDX, SUB, "temperature");
+        let result = run_with_responses(
+            &h,
+            h.client.read(TEMP),
+            vec![Harness::response(0x43, [0xB0, 0xFF, 0x00, 0x00])],
+        );
+        assert_eq!(result.unwrap(), -80i16);
+
+        // ...and for a sign-extending one.
+        let h = Harness::new();
+        let result = run_with_responses(
+            &h,
+            h.client.read(TEMP),
+            vec![Harness::response(0x43, [0xB0, 0xFF, 0xFF, 0xFF])],
+        );
+        assert_eq!(result.unwrap(), -80i16);
+    }
+
+    #[test]
     fn read_i32_negative_value() {
         let h = Harness::new();
         const CURRENT: SdoEntry<i32> = SdoEntry::new(IDX, SUB, "current");
