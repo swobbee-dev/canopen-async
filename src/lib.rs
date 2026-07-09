@@ -21,6 +21,7 @@
 #![cfg_attr(not(test), no_std)]
 #![allow(async_fn_in_trait)]
 
+pub mod dict;
 mod emcy;
 mod frame;
 mod heartbeat;
@@ -29,6 +30,7 @@ pub mod pdo;
 mod protocol;
 mod sdo;
 
+pub use dict::{Domain, OctetString, SdoArray, SdoEntry, SdoScalar, VisibleString};
 pub use emcy::{EmcyMessage, EmcyMonitor};
 pub use frame::{NmtCommand, NmtState};
 pub use heartbeat::HeartbeatMonitor;

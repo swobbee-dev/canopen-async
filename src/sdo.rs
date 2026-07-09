@@ -1,5 +1,6 @@
 //! Async SDO client (CiA 301, 7.2.4).
 
+use crate::dict::{Domain, SdoBytes, SdoEntry, SdoScalar};
 use core::cell::RefCell;
 use crc::{Algorithm, Crc};
 use embassy_sync::{
@@ -922,6 +923,88 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
             }
             Pending::BlockUploadEndWait => self.state.sig_block_upload_end.signal(Err(err)),
         }
+    }
+
+    // ## --- TYPED DICTIONARY ACCESS --- ##
+
+    /// Read a scalar object through its typed dictionary entry.
+    ///
+    /// Uses expedited or segmented transfer as the server chooses. A server
+    /// response shorter than the type is zero-extended (some devices do not
+    /// indicate a size); a longer response fails with `BufferSizeWrong`.
+    pub async fn read<T: SdoScalar>(&self, entry: SdoEntry<T>) -> Result<T, SdoError<TX::Error>> {
+        let mut buf = [0u8; 8];
+        self.read_segmented(entry.index, entry.sub, &mut buf[..T::SIZE])
+            .await?;
+        Ok(T::from_le_bytes(&buf[..T::SIZE]))
+    }
+
+    /// Write a scalar object through its typed dictionary entry.
+    pub async fn write<T: SdoScalar>(
+        &self,
+        entry: SdoEntry<T>,
+        value: T,
+    ) -> Result<(), SdoError<TX::Error>> {
+        let mut buf = [0u8; 8];
+        value.write_le_bytes(&mut buf);
+        if T::SIZE <= 4 {
+            self.write_expedited(entry.index, entry.sub, &buf[..T::SIZE]).await
+        } else {
+            self.write_segmented(entry.index, entry.sub, &buf[..T::SIZE]).await
+        }
+    }
+
+    /// Read a VISIBLE_STRING / OCTET_STRING object into `buf`; returns the
+    /// number of bytes received.
+    pub async fn read_bytes<K: SdoBytes>(
+        &self,
+        entry: SdoEntry<K>,
+        buf: &mut [u8],
+    ) -> Result<usize, SdoError<TX::Error>> {
+        self.read_segmented(entry.index, entry.sub, buf).await
+    }
+
+    /// Write a VISIBLE_STRING / OCTET_STRING object.
+    pub async fn write_bytes<K: SdoBytes>(
+        &self,
+        entry: SdoEntry<K>,
+        data: &[u8],
+    ) -> Result<(), SdoError<TX::Error>> {
+        self.write_segmented(entry.index, entry.sub, data).await
+    }
+
+    /// Read a DOMAIN object via block transfer; returns the number of bytes
+    /// received.
+    pub async fn read_domain(
+        &self,
+        entry: SdoEntry<Domain>,
+        buf: &mut [u8],
+        request_crc_support: bool,
+    ) -> Result<usize, SdoError<TX::Error>> {
+        self.read_block(entry.index, entry.sub, buf, request_crc_support)
+            .await
+    }
+
+    /// Write a DOMAIN object via block transfer from a stream (e.g. a
+    /// firmware image read from external flash).
+    pub async fn write_domain<S: StreamReader<TX::Error> + StreamSeeker<TX::Error>>(
+        &self,
+        entry: SdoEntry<Domain>,
+        stream: &mut S,
+        size: u32,
+        request_crc_support: bool,
+    ) -> Result<(), SdoError<TX::Error>> {
+        self.write_block(entry.index, entry.sub, stream, size, request_crc_support)
+            .await
+    }
+
+    /// Write a small DOMAIN object from a byte slice via segmented transfer.
+    pub async fn write_domain_bytes(
+        &self,
+        entry: SdoEntry<Domain>,
+        data: &[u8],
+    ) -> Result<(), SdoError<TX::Error>> {
+        self.write_segmented(entry.index, entry.sub, data).await
     }
 
     // ## --- HELPER SENDER FUNCTIONS --- ##

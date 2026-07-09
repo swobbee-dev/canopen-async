@@ -292,6 +292,118 @@ fn stale_frame_does_not_eat_pending_request() {
     assert_eq!(result.unwrap(), 0x1234);
 }
 
+mod typed {
+    use super::*;
+    use canopen_async::{Domain, SdoEntry, VisibleString};
+
+    #[test]
+    fn read_u8_via_expedited_reply() {
+        let h = Harness::new();
+        const SOC: SdoEntry<u8> = SdoEntry::new(IDX, SUB, "state of charge");
+        // Expedited response, 1 valid byte (cs 0x4F)
+        let result = run_with_responses(
+            &h,
+            h.client.read(SOC),
+            vec![Harness::response(0x4F, [87, 0, 0, 0])],
+        );
+        assert_eq!(result.unwrap(), 87u8);
+    }
+
+    #[test]
+    fn read_i32_negative_value() {
+        let h = Harness::new();
+        const CURRENT: SdoEntry<i32> = SdoEntry::new(IDX, SUB, "current");
+        let result = run_with_responses(
+            &h,
+            h.client.read(CURRENT),
+            vec![Harness::response(0x43, (-2500i32).to_le_bytes())],
+        );
+        assert_eq!(result.unwrap(), -2500);
+    }
+
+    #[test]
+    fn read_u64_via_segmented_reply() {
+        let h = Harness::new();
+        const ERROR: SdoEntry<u64> = SdoEntry::new(IDX, SUB, "battery error");
+        let value = 0xAABB_CCDD_1122_3344u64.to_le_bytes();
+        let result = run_with_responses(
+            &h,
+            h.client.read(ERROR),
+            vec![
+                Harness::response(0x41, 8u32.to_le_bytes()),
+                // 7 bytes, not last
+                Harness::raw_response(&[
+                    0x00, value[0], value[1], value[2], value[3], value[4], value[5], value[6],
+                ]),
+                // 1 byte (n=6), toggle 1, last -> cs = 0001_1101
+                Harness::raw_response(&[0x1D, value[7], 0, 0, 0, 0, 0, 0]),
+            ],
+        );
+        assert_eq!(result.unwrap(), 0xAABB_CCDD_1122_3344);
+    }
+
+    #[test]
+    fn write_scalars_pick_transfer_mode() {
+        let h = Harness::new();
+        const TTYPE: SdoEntry<u8> = SdoEntry::new(IDX, SUB, "small");
+        let result = run_with_responses(
+            &h,
+            h.client.write(TTYPE, 254u8),
+            vec![Harness::response(0x60, [0; 4])],
+        );
+        assert!(result.is_ok());
+        // 1-byte expedited download: cs 0x2F
+        assert_eq!(h.sent_payloads()[0][..5], [0x2F, 0x00, 0x20, SUB, 254]);
+
+        // u64 goes segmented: initiate (0x21, size 8) + two segments
+        let h = Harness::new();
+        const VALIDITY: SdoEntry<u64> = SdoEntry::new(IDX, SUB, "validity");
+        let result = run_with_responses(
+            &h,
+            h.client.write(VALIDITY, 0x1122_3344_5566_7788),
+            vec![
+                Harness::response(0x60, [0; 4]),
+                Harness::raw_response(&[0x20, 0, 0, 0, 0, 0, 0, 0]), // seg ack t0
+                Harness::raw_response(&[0x30, 0, 0, 0, 0, 0, 0, 0]), // seg ack t1
+            ],
+        );
+        assert!(result.is_ok());
+        let sent = h.sent_payloads();
+        assert_eq!(sent[0][0], 0x21); // initiate segmented download, size indicated
+        assert_eq!(sent[0][4..8], 8u32.to_le_bytes());
+    }
+
+    #[test]
+    fn read_string_and_domain_delegate_to_transfers() {
+        let h = Harness::new();
+        const UID: SdoEntry<VisibleString> = SdoEntry::new(IDX, SUB, "battery UID");
+        let mut buf = [0u8; 16];
+        let result = run_with_responses(
+            &h,
+            h.client.read_bytes(UID, &mut buf),
+            vec![
+                Harness::response(0x41, 4u32.to_le_bytes()),
+                // 4 bytes (n=3), last, toggle 0 -> cs 0000_0111
+                Harness::raw_response(&[0x07, b'A', b'B', b'C', b'D', 0, 0, 0]),
+            ],
+        );
+        assert_eq!(result.unwrap(), 4);
+        assert_eq!(&buf[..4], b"ABCD");
+
+        // Domain read goes through block transfer
+        let h = Harness::new();
+        const NONCE: SdoEntry<Domain> = SdoEntry::new(IDX, SUB, "nonce");
+        let mut buf = [0u8; 32];
+        let result = run_with_batches(
+            &h,
+            h.client.read_domain(NONCE, &mut buf, true),
+            block_upload_batches(0xC6, 10u32.to_le_bytes()),
+        );
+        assert_eq!(result.unwrap(), 10);
+        assert_eq!(buf[..10], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    }
+}
+
 /// XMODEM CRC over `data`, as used by SDO block transfers.
 fn block_crc(data: &[u8]) -> u16 {
     crc::Crc::<u16>::new(&crc::CRC_16_XMODEM).checksum(data)
