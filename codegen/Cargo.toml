@@ -1,0 +1,14 @@
+[package]
+authors = ["Malte Brieske <9287988+mbrieske@users.noreply.github.com>"]
+name = "canopen-async-codegen"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Generate typed canopen-async object dictionaries and PDO payload structs from CANopen EDS files"
+
+[dependencies]
+# none: host-only text processing, std only
+
+[dev-dependencies]
+# compile-check the generated golden output against the runtime crate
+canopen-async = { path = "..", default-features = false }

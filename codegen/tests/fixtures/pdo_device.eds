@@ -1,0 +1,168 @@
+; Synthetic device with mapped PDOs: exercises PDO struct generation,
+; which the real enyring EDS (empty mappings) does not.
+[FileInfo]
+FileName=pdo_device.eds
+FileVersion=1
+FileRevision=0
+
+[DeviceInfo]
+VendorName=Test
+ProductName=PdoDevice
+NrOfRXPDO=1
+NrOfTXPDO=2
+
+[2000]
+ParameterName=Measurements
+ObjectType=0x9
+SubNumber=0x4
+
+[2000sub0]
+ParameterName=Highest sub-index supported
+DataType=0x0005
+AccessType=ro
+DefaultValue=3
+
+[2000sub1]
+ParameterName=Voltage
+DataType=0x0006
+AccessType=ro
+PDOMapping=1
+
+[2000sub2]
+ParameterName=Current
+DataType=0x0004
+AccessType=ro
+PDOMapping=1
+
+[2000sub3]
+ParameterName=Flags
+DataType=0x0005
+AccessType=ro
+PDOMapping=1
+
+[2001]
+ParameterName=Target current
+ObjectType=0x7
+DataType=0x0003
+AccessType=rww
+PDOMapping=1
+
+[1400]
+ParameterName=RPDO communication parameter
+ObjectType=0x9
+SubNumber=0x3
+
+[1400sub0]
+ParameterName=max sub-index
+DataType=0x0005
+AccessType=ro
+DefaultValue=2
+
+[1400sub1]
+ParameterName=COB-ID used by RPDO
+DataType=0x0007
+AccessType=rw
+DefaultValue=$NODEID+0x200
+
+[1400sub2]
+ParameterName=transmission type
+DataType=0x0005
+AccessType=rw
+DefaultValue=255
+
+[1600]
+ParameterName=RPDO mapping parameter
+ObjectType=0x9
+SubNumber=0x2
+
+[1600sub0]
+ParameterName=Number of mapped objects
+DataType=0x0005
+AccessType=rw
+DefaultValue=1
+
+[1600sub1]
+ParameterName=mapped object 1
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x20010010
+
+[1800]
+ParameterName=TPDO communication parameter
+ObjectType=0x9
+SubNumber=0x3
+
+[1800sub0]
+ParameterName=max sub-index
+DataType=0x0005
+AccessType=ro
+DefaultValue=2
+
+[1800sub1]
+ParameterName=COB-ID used by TPDO
+DataType=0x0007
+AccessType=rw
+DefaultValue=$NODEID+0x180
+
+[1800sub2]
+ParameterName=transmission type
+DataType=0x0005
+AccessType=rw
+DefaultValue=254
+
+[1A00]
+ParameterName=TPDO mapping parameter
+ObjectType=0x9
+SubNumber=0x3
+
+[1A00sub0]
+ParameterName=Number of mapped objects
+DataType=0x0005
+AccessType=rw
+DefaultValue=2
+
+[1A00sub1]
+ParameterName=mapped object 1
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x20000110
+
+[1A00sub2]
+ParameterName=mapped object 2
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x20000220
+
+[1801]
+ParameterName=TPDO communication parameter
+ObjectType=0x9
+SubNumber=0x2
+
+[1801sub0]
+ParameterName=max sub-index
+DataType=0x0005
+AccessType=ro
+DefaultValue=1
+
+[1801sub1]
+ParameterName=COB-ID used by TPDO
+DataType=0x0007
+AccessType=rw
+DefaultValue=$NODEID+0x280
+
+[1A01]
+ParameterName=TPDO mapping parameter
+ObjectType=0x9
+SubNumber=0x2
+
+[1A01sub0]
+ParameterName=Number of mapped objects
+DataType=0x0005
+AccessType=rw
+DefaultValue=1
+
+[1A01sub1]
+ParameterName=mapped object 1
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x20000308

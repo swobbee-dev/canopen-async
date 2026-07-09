@@ -1,3 +1,6 @@
+[workspace]
+members = ["codegen"]
+
 [package]
 authors = ["Malte Brieske <9287988+mbrieske@users.noreply.github.com>"]
 name = "canopen-async"
