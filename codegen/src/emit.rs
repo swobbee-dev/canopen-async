@@ -75,6 +75,18 @@ fn doc_line(sub: &Sub) -> String {
     if !sub.default.is_empty() {
         let _ = write!(doc, ", default `{}`", sub.default);
     }
+    match (&sub.low_limit, &sub.high_limit) {
+        (Some(low), Some(high)) => {
+            let _ = write!(doc, ", range `{low}`..=`{high}`");
+        }
+        (Some(low), None) => {
+            let _ = write!(doc, ", min `{low}`");
+        }
+        (None, Some(high)) => {
+            let _ = write!(doc, ", max `{high}`");
+        }
+        (None, None) => {}
+    }
     doc
 }
 
@@ -148,6 +160,13 @@ struct PdoField {
     doc: String,
 }
 
+/// One slot of a PDO payload: a decoded field or anonymous padding bytes
+/// (CiA 301 dummy mappings, indices 0x0001–0x0007).
+enum PdoPart {
+    Field(PdoField),
+    Padding(usize),
+}
+
 fn emit_pdos(out: &mut String, eds: &Eds, config: &Config) -> Result<(), Error> {
     // (comm base, mapping base, COB-ID function-code bases, struct prefix, is_tpdo)
     const KINDS: [(u16, u16, u16, &str, bool); 2] = [
@@ -162,13 +181,13 @@ fn emit_pdos(out: &mut String, eds: &Eds, config: &Config) -> Result<(), Error> 
                 continue;
             };
 
-            let fields = resolve_mapping_fields(eds, mapping)?;
-            if fields.is_empty() {
-                continue; // unmapped PDO: nothing to generate
+            let parts = resolve_mapping_parts(eds, mapping)?;
+            if !parts.iter().any(|p| matches!(p, PdoPart::Field(_))) {
+                continue; // unmapped (or all-padding) PDO: nothing to generate
             }
 
             let num = pdo_number(comm, cob_base).unwrap_or(offset as u8 + 1);
-            emit_pdo_struct(out, config, &format!("{prefix}{num}"), num, &fields, is_tpdo);
+            emit_pdo_struct(out, config, &format!("{prefix}{num}"), num, &parts, is_tpdo);
         }
     }
     Ok(())
@@ -184,8 +203,8 @@ fn pdo_number(comm: &Object, cob_base: u16) -> Option<u8> {
     (1..=4).contains(&num).then_some(num as u8)
 }
 
-fn resolve_mapping_fields(eds: &Eds, mapping: &Object) -> Result<Vec<PdoField>, Error> {
-    let mut fields = Vec::new();
+fn resolve_mapping_parts(eds: &Eds, mapping: &Object) -> Result<Vec<PdoPart>, Error> {
+    let mut parts = Vec::new();
     let mut scope = HashSet::new();
     let mut total_bits = 0u32;
 
@@ -203,6 +222,17 @@ fn resolve_mapping_fields(eds: &Eds, mapping: &Object) -> Result<Vec<PdoField>, 
         if bits % 8 != 0 {
             return Err(Error(format!("{context}: {bits}-bit mapping is not byte-aligned (unsupported)")));
         }
+        total_bits += bits;
+        if total_bits > 64 {
+            return Err(Error(format!("{context}: mappings exceed 64 bits")));
+        }
+
+        // Dummy mappings (basic data type indices) are padding, not data
+        if (0x0001..=0x0007).contains(&index) {
+            parts.push(PdoPart::Padding(bits as usize / 8));
+            continue;
+        }
+
         let target = eds
             .find_object(index)
             .and_then(|o| o.find_sub(target_sub))
@@ -217,24 +247,20 @@ fn resolve_mapping_fields(eds: &Eds, mapping: &Object) -> Result<Vec<PdoField>, 
                 size * 8
             )));
         }
-        total_bits += bits;
-        if total_bits > 64 {
-            return Err(Error(format!("{context}: mappings exceed 64 bits")));
-        }
 
         let name = dedupe(
             &mut scope,
             item_name(&target.name).unwrap_or_else(|| format!("field_{sub_index}")),
         );
-        fields.push(PdoField {
+        parts.push(PdoPart::Field(PdoField {
             name,
             rust_type: target.data_type.rust_type(),
             size,
             doc: format!("`{}` ({index:#06X}:{target_sub:#04X})", target.name),
-        });
+        }));
     }
 
-    Ok(fields)
+    Ok(parts)
 }
 
 fn emit_pdo_struct(
@@ -242,11 +268,17 @@ fn emit_pdo_struct(
     config: &Config,
     struct_name: &str,
     num: u8,
-    fields: &[PdoField],
+    parts: &[PdoPart],
     is_tpdo: bool,
 ) {
     let crate_path = &config.crate_path;
-    let total: usize = fields.iter().map(|f| f.size).sum();
+    let total: usize = parts
+        .iter()
+        .map(|p| match p {
+            PdoPart::Field(f) => f.size,
+            PdoPart::Padding(bytes) => *bytes,
+        })
+        .sum();
     let direction = if is_tpdo { "transmitted by the node" } else { "received by the node" };
 
     let _ = writeln!(out);
@@ -259,9 +291,11 @@ fn emit_pdo_struct(
         }
     }
     let _ = writeln!(out, "pub struct {struct_name} {{");
-    for field in fields {
-        let _ = writeln!(out, "    /// {}", field.doc);
-        let _ = writeln!(out, "    pub {}: {},", field.name, field.rust_type);
+    for part in parts {
+        if let PdoPart::Field(field) = part {
+            let _ = writeln!(out, "    /// {}", field.doc);
+            let _ = writeln!(out, "    pub {}: {},", field.name, field.rust_type);
+        }
     }
     let _ = writeln!(out, "}}");
 
@@ -279,16 +313,21 @@ fn emit_pdo_struct(
         let _ = writeln!(out, "        }}");
         let _ = writeln!(out, "        Some(Self {{");
         let mut offset = 0usize;
-        for field in fields {
-            let _ = writeln!(
-                out,
-                "            {}: <{} as SdoScalar>::from_le_bytes(&data[{}..{}]),",
-                field.name,
-                field.rust_type,
-                offset,
-                offset + field.size
-            );
-            offset += field.size;
+        for part in parts {
+            match part {
+                PdoPart::Field(field) => {
+                    let _ = writeln!(
+                        out,
+                        "            {}: <{} as SdoScalar>::from_le_bytes(&data[{}..{}]),",
+                        field.name,
+                        field.rust_type,
+                        offset,
+                        offset + field.size
+                    );
+                    offset += field.size;
+                }
+                PdoPart::Padding(bytes) => offset += bytes,
+            }
         }
         let _ = writeln!(out, "        }})");
         let _ = writeln!(out, "    }}");
@@ -304,15 +343,21 @@ fn emit_pdo_struct(
         let _ = writeln!(out, "        use {crate_path}::dict::SdoScalar;");
         let _ = writeln!(out, "        let mut data = [0u8; 8];");
         let mut offset = 0usize;
-        for field in fields {
-            let _ = writeln!(
-                out,
-                "        SdoScalar::write_le_bytes(self.{}, &mut data[{}..{}]);",
-                field.name,
-                offset,
-                offset + field.size
-            );
-            offset += field.size;
+        for part in parts {
+            match part {
+                PdoPart::Field(field) => {
+                    let _ = writeln!(
+                        out,
+                        "        SdoScalar::write_le_bytes(self.{}, &mut data[{}..{}]);",
+                        field.name,
+                        offset,
+                        offset + field.size
+                    );
+                    offset += field.size;
+                }
+                // Padding bytes stay zero
+                PdoPart::Padding(bytes) => offset += bytes,
+            }
         }
         let _ = writeln!(out, "        (data, {total})");
         let _ = writeln!(out, "    }}");

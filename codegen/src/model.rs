@@ -124,6 +124,8 @@ pub struct Sub {
     pub data_type: DataType,
     pub access: AccessType,
     pub default: String,
+    pub low_limit: Option<String>,
+    pub high_limit: Option<String>,
 }
 
 #[derive(Debug)]
@@ -243,7 +245,7 @@ fn build_object(
 
     match object_type {
         0x7 => {
-            let sub = build_sub(index, 0, name.clone(), section)?;
+            let sub = build_sub(index, 0, name.clone(), section, diagnostics)?;
             Ok(Object {
                 index,
                 name,
@@ -256,7 +258,7 @@ fn build_object(
             for sub_section in &ini.sections {
                 if let Some(sub_index) = sub_section_index(&sub_section.name, index) {
                     let sub_name = sub_section.get("ParameterName").unwrap_or_default().to_string();
-                    subs.push(build_sub(index, sub_index, sub_name, sub_section)?);
+                    subs.push(build_sub(index, sub_index, sub_name, sub_section, diagnostics)?);
                 }
             }
             subs.sort_by_key(|s| s.sub);
@@ -275,6 +277,23 @@ fn build_object(
                 let element_types: Vec<_> =
                     subs.iter().filter(|s| s.sub != 0).map(|s| s.data_type).collect();
                 if element_types.windows(2).all(|w| w[0] == w[1]) && !element_types.is_empty() {
+                    // Sub 0 usually declares the element count. A nonzero
+                    // declared count disagreeing with the highest element
+                    // sub-index usually means a truncated file. Zero is
+                    // exempt: some arrays report a *dynamic* count there
+                    // (e.g. 0x1003, number of active errors).
+                    let max_sub = subs.iter().map(|s| s.sub).max().unwrap_or(0);
+                    if let Some(declared) = subs
+                        .iter()
+                        .find(|s| s.sub == 0)
+                        .and_then(|s| parse_number(&s.default))
+                        .filter(|&count| count != 0)
+                        && declared != max_sub as u32
+                    {
+                        diagnostics.push(format!(
+                            "object {index:#06X} `{name}`: sub 0 declares {declared} elements but the highest element sub-index is {max_sub}"
+                        ));
+                    }
                     ObjectKind::Array(subs)
                 } else {
                     diagnostics.push(format!(
@@ -311,7 +330,13 @@ fn sub_section_index(name: &str, object_index: u16) -> Option<u8> {
     u8::from_str_radix(sub_hex, 16).ok()
 }
 
-fn build_sub(index: u16, sub: u8, name: String, section: &Section) -> Result<Sub, Error> {
+fn build_sub(
+    index: u16,
+    sub: u8,
+    name: String,
+    section: &Section,
+    diagnostics: &mut Vec<String>,
+) -> Result<Sub, Error> {
     let dt_raw = section.get_nonempty("DataType").ok_or_else(|| {
         Error(format!("object {index:#06X} sub {sub:#04X} `{name}`: missing DataType"))
     })?;
@@ -328,13 +353,81 @@ fn build_sub(index: u16, sub: u8, name: String, section: &Section) -> Result<Sub
         .and_then(AccessType::from_str)
         .unwrap_or(AccessType::ReadWrite);
 
-    Ok(Sub {
+    let entry = Sub {
         sub,
         name,
         data_type,
         access,
         default: section.get("DefaultValue").unwrap_or_default().to_string(),
-    })
+        low_limit: section.get_nonempty("LowLimit").map(str::to_string),
+        high_limit: section.get_nonempty("HighLimit").map(str::to_string),
+    };
+    validate_default(index, &entry, diagnostics);
+    Ok(entry)
+}
+
+/// Diagnose defaults that do not parse as (or exceed the range of) the
+/// declared scalar type. Strings/domain and `$NODEID+…` expressions are
+/// exempt; a broken default usually means a broken vendor file.
+fn validate_default(index: u16, sub: &Sub, diagnostics: &mut Vec<String>) {
+    let value = sub.default.trim();
+    if value.is_empty() || value.starts_with("$NODEID") || value.starts_with("$NodeID") {
+        return;
+    }
+    let Some(size) = sub.data_type.scalar_size() else {
+        return; // strings/domain carry free-form defaults
+    };
+
+    let context = || {
+        format!(
+            "object {index:#06X} sub {:#04X} `{}`: DefaultValue `{value}`",
+            sub.sub, sub.name
+        )
+    };
+
+    match sub.data_type {
+        DataType::F32 | DataType::F64 => {
+            if value.parse::<f64>().is_err() {
+                diagnostics.push(format!("{} does not parse as a float", context()));
+            }
+        }
+        DataType::Boolean => {
+            if !matches!(value, "0" | "1" | "true" | "false") {
+                diagnostics.push(format!("{} is not a boolean", context()));
+            }
+        }
+        _ => {
+            let parsed: Option<i128> = if let Some(hex) =
+                value.strip_prefix("0x").or_else(|| value.strip_prefix("0X"))
+            {
+                i128::from_str_radix(hex, 16).ok()
+            } else {
+                value.parse().ok()
+            };
+            let Some(parsed) = parsed else {
+                diagnostics.push(format!("{} does not parse as an integer", context()));
+                return;
+            };
+            // Hex defaults for signed types conventionally carry the two's
+            // complement bit pattern, so the upper bound is the unsigned
+            // maximum of the type's width either way.
+            let max = if size == 8 { u64::MAX as i128 } else { (1i128 << (size * 8)) - 1 };
+            let min = match sub.data_type {
+                DataType::I8 => i8::MIN as i128,
+                DataType::I16 => i16::MIN as i128,
+                DataType::I32 => i32::MIN as i128,
+                DataType::I64 => i64::MIN as i128,
+                _ => 0,
+            };
+            if parsed < min || parsed > max {
+                diagnostics.push(format!(
+                    "{} is out of range for {}",
+                    context(),
+                    sub.data_type.rust_type()
+                ));
+            }
+        }
+    }
 }
 
 fn cross_check_membership_lists(ini: &Ini, objects: &[Object], diagnostics: &mut Vec<String>) {
@@ -464,6 +557,59 @@ AccessType=ro
         assert_eq!(parse_nodeid_expr("0x200"), Some((0x200, false)));
         assert_eq!(parse_nodeid_expr("128"), Some((128, false)));
         assert_eq!(parse_nodeid_expr(""), None);
+    }
+
+    #[test]
+    fn suspicious_defaults_are_diagnosed() {
+        // Out of range for u8
+        let eds = Eds::parse("[2000]\nParameterName=X\nDataType=0x0005\nAccessType=ro\nDefaultValue=300\n").unwrap();
+        assert!(eds.diagnostics.iter().any(|d| d.contains("out of range")));
+
+        // Unparsable integer
+        let eds = Eds::parse("[2000]\nParameterName=X\nDataType=0x0006\nAccessType=ro\nDefaultValue=abc\n").unwrap();
+        assert!(eds.diagnostics.iter().any(|d| d.contains("does not parse")));
+
+        // Two's complement hex for signed types is accepted
+        let eds = Eds::parse("[2000]\nParameterName=X\nDataType=0x0002\nAccessType=ro\nDefaultValue=0xFF\n").unwrap();
+        assert!(eds.diagnostics.is_empty());
+
+        // $NODEID expressions are exempt
+        let eds = Eds::parse("[2000]\nParameterName=X\nDataType=0x0007\nAccessType=ro\nDefaultValue=$NODEID+0x80\n").unwrap();
+        assert!(eds.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn array_count_mismatch_is_diagnosed_unless_dynamic() {
+        const ARRAY: &str = "\
+[3000]
+ParameterName=A
+ObjectType=0x8
+SubNumber=0x3
+[3000sub0]
+ParameterName=count
+DataType=0x0005
+AccessType=ro
+DefaultValue=DECLARED
+[3000sub1]
+ParameterName=e1
+DataType=0x0006
+AccessType=ro
+[3000sub2]
+ParameterName=e2
+DataType=0x0006
+AccessType=ro
+";
+        // Declared count disagrees with the highest element sub-index
+        let eds = Eds::parse(&ARRAY.replace("DECLARED", "5")).unwrap();
+        assert!(eds.diagnostics.iter().any(|d| d.contains("declares 5 elements")));
+
+        // Matching count: clean
+        let eds = Eds::parse(&ARRAY.replace("DECLARED", "2")).unwrap();
+        assert!(eds.diagnostics.is_empty());
+
+        // Zero means "dynamic count" (e.g. 0x1003) and is exempt
+        let eds = Eds::parse(&ARRAY.replace("DECLARED", "0")).unwrap();
+        assert!(eds.diagnostics.is_empty());
     }
 
     #[test]

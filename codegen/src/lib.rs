@@ -1,26 +1,32 @@
 //! Generate typed [canopen-async](../canopen_async/index.html) object
 //! dictionaries and PDO payload structs from CANopen EDS files.
 //!
-//! Intended for use from a `build.rs`, mirroring the dbc-codegen pattern:
+//! Intended for use from a `build.rs`. The simplest flow generates into
+//! `OUT_DIR` under a label and includes it via canopen-async's
+//! `include_dictionary!` macro:
 //!
 //! ```no_run
+//! // build.rs
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let source = canopen_async_codegen::read_eds_file("eds/bat_enyring.eds")?;
-//! let code = canopen_async_codegen::Config::new("bat_enyring.eds", &source).generate()?;
-//! std::fs::write("out/enyring_dict.rs", code)?;
+//! canopen_async_codegen::build_dictionary("ENYRING", "eds/bat_enyring.eds")?;
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! Include the output in a wrapping module (the wrapper's `#[allow]` covers
-//! lints for unused entries):
-//!
 //! ```ignore
+//! // main.rs — the wrapper's #[allow] covers lints for unused entries
 //! #[allow(dead_code)]
 //! mod dict {
-//!     include!(concat!(env!("OUT_DIR"), "/enyring_dict.rs"));
+//!     canopen_async::include_dictionary!(ENYRING);
 //! }
 //! ```
+//!
+//! Parser diagnostics (skipped lines, count mismatches, suspicious default
+//! values) are printed as `cargo:warning` lines. For full control over
+//! output location and [`Config`] options, use [`read_eds_file`] +
+//! [`Config::generate`] directly and `include!` the file yourself.
+
+use std::path::{Path, PathBuf};
 
 mod emit;
 mod model;
@@ -28,6 +34,72 @@ mod names;
 mod parse;
 
 pub use parse::read_eds_file;
+
+/// Generate a dictionary from a build script, for inclusion via
+/// canopen-async's `include_dictionary!` macro.
+///
+/// Writes the generated code to `OUT_DIR`, exports its path as the
+/// `CANOPEN_DICTIONARY_<NAME>` environment variable (consumed by the macro),
+/// emits `cargo:rerun-if-changed` for the EDS file, and surfaces parser
+/// diagnostics as `cargo:warning` lines.
+pub fn build_dictionary(name: &str, eds_path: impl AsRef<Path>) -> Result<(), Error> {
+    build_dictionary_with(name, eds_path, |config| config)
+}
+
+/// Like [`build_dictionary`], with a hook to adjust the [`Config`]
+/// (e.g. `|c| c.derive_defmt(DefmtDerive::Feature("defmt-print".into()))`).
+pub fn build_dictionary_with(
+    name: &str,
+    eds_path: impl AsRef<Path>,
+    configure: impl FnOnce(Config) -> Config,
+) -> Result<(), Error> {
+    let out_dir = std::env::var_os("OUT_DIR").ok_or_else(|| {
+        Error("OUT_DIR is not set; build_dictionary must run from a build script".to_string())
+    })?;
+    let eds_path = eds_path.as_ref();
+
+    let (file, diagnostics) = generate_dictionary_file(name, eds_path, Path::new(&out_dir), configure)?;
+
+    println!("cargo:rerun-if-changed={}", eds_path.display());
+    println!("cargo:rustc-env=CANOPEN_DICTIONARY_{name}={}", file.display());
+    for diagnostic in diagnostics {
+        println!("cargo:warning={}: {diagnostic}", eds_path.display());
+    }
+    Ok(())
+}
+
+/// Build-script-independent core of [`build_dictionary`]: generate into
+/// `out_dir/canopen_dictionary_<name>.rs` and return the path plus parser
+/// diagnostics.
+pub fn generate_dictionary_file(
+    name: &str,
+    eds_path: &Path,
+    out_dir: &Path,
+    configure: impl FnOnce(Config) -> Config,
+) -> Result<(PathBuf, Vec<String>), Error> {
+    if name.is_empty()
+        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        || name.starts_with(|c: char| c.is_ascii_digit())
+    {
+        return Err(Error(format!(
+            "dictionary name `{name}` must be a valid identifier (used in the CANOPEN_DICTIONARY_<NAME> env var)"
+        )));
+    }
+
+    let source = read_eds_file(eds_path)?;
+    let eds_name = eds_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| eds_path.display().to_string());
+
+    let config = configure(Config::new(&eds_name, &source));
+    let (code, diagnostics) = config.generate_with_diagnostics()?;
+
+    let file = out_dir.join(format!("canopen_dictionary_{name}.rs"));
+    std::fs::write(&file, code)
+        .map_err(|e| Error(format!("failed to write {}: {e}", file.display())))?;
+    Ok((file, diagnostics))
+}
 
 /// Generation failure: unparsable or unsupported EDS content. The message
 /// names the object/sub-entry concerned.

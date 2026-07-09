@@ -43,12 +43,14 @@ pub mod tpdo_communication_parameter_2 {
 /// `TPDO mapping parameter` (0x1A00, RECORD)
 pub mod tpdo_mapping_parameter {
     use ::canopen_async::dict::*;
-    /// `Number of mapped objects` — rw, default `2`
+    /// `Number of mapped objects` — rw, default `3`
     pub const NUMBER_OF_MAPPED_OBJECTS: SdoEntry<u8> = SdoEntry::new(0x1A00, 0x00, "Number of mapped objects");
     /// `mapped object 1` — rw, default `0x20000110`
     pub const MAPPED_OBJECT_1: SdoEntry<u32> = SdoEntry::new(0x1A00, 0x01, "mapped object 1");
-    /// `mapped object 2` — rw, default `0x20000220`
+    /// `mapped object 2` — rw, default `0x00050008`
     pub const MAPPED_OBJECT_2: SdoEntry<u32> = SdoEntry::new(0x1A00, 0x02, "mapped object 2");
+    /// `mapped object 3` — rw, default `0x20000220`
+    pub const MAPPED_OBJECT_3: SdoEntry<u32> = SdoEntry::new(0x1A00, 0x03, "mapped object 3");
 }
 /// `TPDO mapping parameter` (0x1A01, RECORD)
 pub mod tpdo_mapping_parameter_2 {
@@ -70,10 +72,10 @@ pub mod measurements {
     /// `Flags` — ro
     pub const FLAGS: SdoEntry<u8> = SdoEntry::new(0x2000, 0x03, "Flags");
 }
-/// `Target current` — rww
+/// `Target current` — rww, range `-5000`..=`5000`
 pub const TARGET_CURRENT: SdoEntry<i16> = SdoEntry::new(0x2001, 0x00, "Target current");
 
-/// Tpdo1 payload (transmitted by the node, PDO 1, 6 bytes)
+/// Tpdo1 payload (transmitted by the node, PDO 1, 7 bytes)
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tpdo1 {
     /// `Voltage` (0x2000:0x01)
@@ -85,12 +87,12 @@ pub struct Tpdo1 {
 impl ::canopen_async::pdo::PdoPayload for Tpdo1 {
     fn decode(data: &[u8]) -> Option<Self> {
         use ::canopen_async::dict::SdoScalar;
-        if data.len() < 6 {
+        if data.len() < 7 {
             return None;
         }
         Some(Self {
             voltage: <u16 as SdoScalar>::from_le_bytes(&data[0..2]),
-            current: <i32 as SdoScalar>::from_le_bytes(&data[2..6]),
+            current: <i32 as SdoScalar>::from_le_bytes(&data[3..7]),
         })
     }
 }
