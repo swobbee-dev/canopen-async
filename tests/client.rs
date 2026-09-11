@@ -8,7 +8,7 @@ use core::cell::RefCell;
 use std::rc::Rc;
 use std::vec::Vec;
 
-use canopen_async::{SdoClient, SdoError};
+use canopen_async::{SdoClient, SdoError, SdoOverrides};
 use common::{MockTx, TestFrame};
 use embassy_time::Duration;
 use embedded_can::{Frame, Id, StandardId};
@@ -464,6 +464,54 @@ fn block_upload_batches(init_cs: u8, init_tail: [u8; 4]) -> Vec<Vec<TestFrame>> 
         // response to sub-block ack: end frame, n=4 -> cs = 110_100_01
         vec![Harness::raw_response(&[0xD1, crc[0], crc[1], 0, 0, 0, 0, 0])],
     ]
+}
+
+/// Batches for a complete block upload of a larger `payload`,
+/// cut into sub-blocks of `blksize` segments.
+fn block_upload_batches_of(payload: &[u8], blksize: usize) -> Vec<Vec<TestFrame>> {
+    let crc = block_crc(payload).to_le_bytes();
+    let mut batches = vec![vec![Harness::response(0xC6, (payload.len() as u32).to_le_bytes())]];
+
+    let chunks: Vec<&[u8]> = payload.chunks(7).collect();
+    let last = chunks.len() - 1;
+    let segments: Vec<TestFrame> = chunks
+        .iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            let seqno = (i % blksize) as u8 + 1;
+            // Padding in the final segment needs to be dropped
+            let mut frame = [0xEEu8; 8];
+            frame[0] = if i == last { 0x80 | seqno } else { seqno };
+            frame[1..1 + chunk.len()].copy_from_slice(chunk);
+            Harness::raw_response(&frame)
+        })
+        .collect();
+    batches.extend(segments.chunks(blksize).map(<[TestFrame]>::to_vec));
+
+    // End frame: cs = 110_nnn_01, nnn = unused bytes in the last segment.
+    let unused = ((7 - payload.len() % 7) % 7) as u8;
+    batches.push(vec![Harness::raw_response(&[0xC1 | (unused << 2), crc[0], crc[1], 0, 0, 0, 0, 0])]);
+    batches
+}
+
+#[test]
+fn read_block_honours_a_client_blksize_override() {
+    // Propose a sub-block no larger than the segment channel size keeps
+    // bursts within what the channel.
+    let payload: Vec::<u8> = (1..=60u8).collect();
+    let mut h = Harness::new();
+    h.client.use_overrides(SdoOverrides {
+        read_blksize: Some(4),
+        write_segment_delay: None,
+    });
+    let mut buf = [0u8; 1000];
+    let result = run_with_batches(&h, h.client.read_block(IDX, SUB, &mut buf, true), block_upload_batches_of(&payload, 4));
+
+    assert_eq!(result.unwrap(), payload.len());
+    assert_eq!(&buf[..payload.len()], &payload[..]);
+
+    // Ensure blksize has reached the server.
+    assert_eq!(h.sent_payloads()[0][4], 4);
 }
 
 #[test]
