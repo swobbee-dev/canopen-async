@@ -54,4 +54,4 @@ pub use heartbeat::HeartbeatMonitor;
 pub use node::{NodeClient, NodeEvent};
 pub use pdo::{PdoConfig, PdoMappingEntry, PdoPayload, PdoSlot};
 pub use protocol::{BlockAck, BlockInit, BlockUploadInit, BlockUploadSegment, Segment};
-pub use sdo::{SdoClient, SdoError, SeekFrom, StreamReader, StreamSeeker};
+pub use sdo::{SdoClient, SdoError, SeekFrom, StreamReader, StreamSeeker, SdoOverrides};

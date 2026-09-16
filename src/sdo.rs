@@ -93,12 +93,22 @@ pub trait StreamSeeker<E> {
     }
 }
 
+/// Some connections might set the params, which they cannot hold
+/// In such case there is a way to override them
+pub struct SdoOverrides {
+    /// Block size used when reading (upload); `None` -> 127 (max)
+    pub read_blksize: Option<u8>,
+    /// Delay between block segments writes
+    pub write_segment_delay: Option<Duration>
+}
+
 pub struct SdoClient<FRAME, TX: CanTx<Frame = FRAME>> {
     node_id: u8,
     request_lock: Mutex<NoopRawMutex, ()>,
     state: RequestState<FRAME, TX>,
     can_tx: Mutex<NoopRawMutex, TX>,
     timeout: Duration,
+    overrides: Option<SdoOverrides>
 }
 
 // A queue size of 4 should be sufficient for most CAN bus conditions.
@@ -185,7 +195,12 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
             },
             can_tx: Mutex::new(tx),
             timeout,
+            overrides: None
         })
+    }
+
+    pub fn use_overrides(&mut self, overrides: SdoOverrides) {
+        self.overrides = Some(overrides)
     }
 
     async fn request_response<'a, R>(
@@ -594,7 +609,11 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         self.state.sig_block_upload_init.reset();
 
         // The client proposes a block size. 127 is the max.
-        let client_blksize: u8 = 127;
+        let client_blksize: u8 = if let Some(overrides) = &self.overrides && overrides.read_blksize.is_some() {
+            overrides.read_blksize.unwrap()
+        } else {
+            127
+        };
 
         self.send_initiate_block_upload(index, sub, client_blksize, request_crc_support)
             .await
@@ -766,6 +785,7 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
         };
 
         let use_crc = request_crc_support && server_supports_crc;
+        let segment_delay = self.overrides.as_ref().and_then(|o| o.write_segment_delay);
 
         if blksize == 0 || blksize > 127 {
             return Err(self.abort_transfer(index, sub, ABORT_INVALID_BLOCK_SIZE).await);
@@ -799,6 +819,10 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                 self.send_block_download_segment(chunk, seqno, last_segment_of_transfer)
                     .await
                     .map_err(SdoError::TxError)?;
+
+                if let Some(delay) = segment_delay {
+                    embassy_time::Timer::after(delay).await;
+                }
 
                 if last_segment_of_transfer {
                     break;
@@ -865,6 +889,10 @@ impl<FRAME: Frame, TX: CanTx<Frame = FRAME>> SdoClient<FRAME, TX> {
                         self.send_block_download_segment(chunk, seqno_to_resend, is_last)
                             .await
                             .map_err(SdoError::TxError)?;
+
+                        if let Some(delay) = segment_delay {
+                            embassy_time::Timer::after(delay).await;
+                        }
 
                         if is_last {
                             break;
