@@ -1,7 +1,4 @@
 //! Async SDO client (CiA 301, 7.2.4).
-//! Optional `Overrides` struct allows:
-//! - setting client's blksize
-//! - delaying writes to a slow server
 
 use crate::dict::{Domain, SdoBytes, SdoEntry, SdoScalar};
 use core::cell::RefCell;
